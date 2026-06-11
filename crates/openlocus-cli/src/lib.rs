@@ -12,6 +12,9 @@ use openlocus_retrieval::bm25_search::bm25_search;
 use openlocus_retrieval::regex_search::{regex_search, text_search};
 use openlocus_retrieval::rrf::rrf_combine;
 use openlocus_retrieval::symbol_search::symbol_search;
+use openlocus_store::StoreBackend;
+use openlocus_store::conservative::ConservativeChunkStore;
+use openlocus_store::tdb_placeholder::TdbPlaceholderStore;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,6 +79,11 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Store operations (build, status, purge)
+    Store {
+        #[command(subcommand)]
+        store_cmd: StoreCommands,
+    },
     /// Print version
     Version,
 }
@@ -128,6 +136,37 @@ pub enum CitationsCommands {
     Validate {
         /// Path to JSON file containing Evidence array or object with evidence field
         json_file: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StoreCommands {
+    /// Show store backend status
+    Status {
+        /// Backend name: conservative or tdb
+        #[arg(default_value = "conservative")]
+        backend: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build store from scanned files
+    Build {
+        /// Backend name: conservative or tdb
+        #[arg(default_value = "conservative")]
+        backend: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Purge store data
+    Purge {
+        /// Backend name: conservative or tdb
+        #[arg(default_value = "conservative")]
+        backend: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -311,6 +350,38 @@ pub fn run() -> Result<()> {
             );
             print_output(&pack, json)
         }
+        Commands::Store { store_cmd } => match store_cmd {
+            StoreCommands::Status { backend, json } => {
+                let result = store_status(&repo_root, &policy, &backend)?;
+                trace_event(
+                    &repo_root,
+                    "store_status",
+                    serde_json::json!({"backend": backend}),
+                    serde_json::json!({"available": result.available}),
+                );
+                print_output(&result, json)
+            }
+            StoreCommands::Build { backend, json } => {
+                let result = store_build(&repo_root, &policy, &backend)?;
+                trace_event(
+                    &repo_root,
+                    "store_build",
+                    serde_json::json!({"backend": backend}),
+                    serde_json::json!({"chunk_count": result.chunk_count, "file_count": result.file_count}),
+                );
+                print_output(&result, json)
+            }
+            StoreCommands::Purge { backend, json } => {
+                let result = store_purge(&backend)?;
+                trace_event(
+                    &repo_root,
+                    "store_purge",
+                    serde_json::json!({"backend": backend}),
+                    serde_json::json!({"purged": true}),
+                );
+                print_output(&result, json)
+            }
+        },
         Commands::Version => {
             println!("openlocus {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -493,4 +564,173 @@ fn build_context_lite(repo_root: &Path, write_files: bool) -> Result<ContextLite
         test_outputs: None,
         trace_id,
     })
+}
+
+// ── Store helpers ────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreStatusResult {
+    backend: String,
+    available: bool,
+    mode: String,
+    persistent: bool,
+    success: bool,
+    capabilities: openlocus_store::StoreCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn store_status(_repo_root: &Path, _policy: &Policy, backend: &str) -> Result<StoreStatusResult> {
+    match backend {
+        "conservative" => {
+            let store = ConservativeChunkStore::new();
+            let health = store.health();
+            Ok(StoreStatusResult {
+                backend: store.name().to_string(),
+                available: health.available,
+                mode: "ephemeral_in_memory".to_string(),
+                persistent: false,
+                success: true,
+                capabilities: health.capabilities,
+                snapshot_id: health.snapshot_id,
+                error: health.error,
+            })
+        }
+        "tdb" => {
+            let store = TdbPlaceholderStore::new();
+            let health = store.health();
+            Ok(StoreStatusResult {
+                backend: store.name().to_string(),
+                available: false,
+                mode: "placeholder".to_string(),
+                persistent: false,
+                success: false,
+                capabilities: health.capabilities.clone(),
+                snapshot_id: health.snapshot_id,
+                error: health.error.or_else(|| {
+                    Some("TDB backend not available: feature 'tdb' is not enabled".into())
+                }),
+            })
+        }
+        _ => Ok(StoreStatusResult {
+            backend: backend.to_string(),
+            available: false,
+            mode: "unknown".to_string(),
+            persistent: false,
+            success: false,
+            capabilities: openlocus_store::StoreCapabilities::none(),
+            snapshot_id: None,
+            error: Some(format!("unknown backend: {}", backend)),
+        }),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreBuildResult {
+    backend: String,
+    chunk_count: usize,
+    file_count: usize,
+    mode: String,
+    persistent: bool,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn store_build(repo_root: &Path, policy: &Policy, backend: &str) -> Result<StoreBuildResult> {
+    match backend {
+        "conservative" => {
+            let records = scan_repo(repo_root, policy)?;
+            let mut store = ConservativeChunkStore::new();
+            match store.build(repo_root, &records) {
+                Ok(debug) => Ok(StoreBuildResult {
+                    backend: debug.backend_name,
+                    chunk_count: debug.chunk_count,
+                    file_count: debug.file_count,
+                    mode: "ephemeral_in_memory".to_string(),
+                    persistent: false,
+                    success: true,
+                    snapshot_id: debug.snapshot_id,
+                    error: None,
+                }),
+                Err(e) => Ok(StoreBuildResult {
+                    backend: backend.to_string(),
+                    chunk_count: 0,
+                    file_count: 0,
+                    mode: "ephemeral_in_memory".to_string(),
+                    persistent: false,
+                    success: false,
+                    snapshot_id: None,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+        "tdb" => Ok(StoreBuildResult {
+            backend: "tdb".to_string(),
+            chunk_count: 0,
+            file_count: 0,
+            mode: "placeholder".to_string(),
+            persistent: false,
+            success: false,
+            snapshot_id: None,
+            error: Some("TDB backend not available: feature 'tdb' is not enabled".to_string()),
+        }),
+        _ => Ok(StoreBuildResult {
+            backend: backend.to_string(),
+            chunk_count: 0,
+            file_count: 0,
+            mode: "unknown".to_string(),
+            persistent: false,
+            success: false,
+            snapshot_id: None,
+            error: Some(format!("unknown backend: {}", backend)),
+        }),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StorePurgeResult {
+    backend: String,
+    purged: bool,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn store_purge(backend: &str) -> Result<StorePurgeResult> {
+    match backend {
+        "conservative" => {
+            let mut store = ConservativeChunkStore::new();
+            match store.purge() {
+                Ok(()) => Ok(StorePurgeResult {
+                    backend: store.name().to_string(),
+                    purged: true,
+                    success: true,
+                    error: None,
+                }),
+                Err(e) => Ok(StorePurgeResult {
+                    backend: backend.to_string(),
+                    purged: false,
+                    success: false,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+        "tdb" => Ok(StorePurgeResult {
+            backend: "tdb".to_string(),
+            purged: false,
+            success: false,
+            error: Some("TDB backend not available: feature 'tdb' is not enabled".to_string()),
+        }),
+        _ => Ok(StorePurgeResult {
+            backend: backend.to_string(),
+            purged: false,
+            success: false,
+            error: Some(format!("unknown backend: {}", backend)),
+        }),
+    }
 }

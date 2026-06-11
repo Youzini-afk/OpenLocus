@@ -130,3 +130,61 @@ BM25 over bounded line chunks with line tightening will outperform plain regex f
 - Line-level metrics are low because gold spans target specific code regions; the eval is more meaningful for file-level metrics at this stage.
 - BM25 CLI end-to-end latency includes index build; a persistent index would reduce this significantly.
 - The Rust `regex` crate does not support lookahead; symbol boundary uses consuming match `(?:[^a-zA-Z0-9_]|$)` instead.
+
+---
+
+## 2026-06-11 — R3 Level0 Storage Scaffold/Conformance
+
+### Objective
+
+Add Store traits + StoreHit materialization gate + conservative storage surface + TDB Level 0 test surface. Do not implement dense/LLM/graph quality or make TDB a default dependency. This is a Level0 storage scaffold, not a full storage bakeoff or TDB comparison.
+
+### Hypothesis
+
+A storage abstraction layer with materialization gating (StoreHit → filesystem Evidence) will enable safe backend substitution. The conservative in-memory chunk store should pass conformance tests. TDB can be represented as a placeholder that correctly reports unavailability rather than being silently missing.
+
+### Implementation notes
+
+- **Store crate** (`openlocus-store`): New workspace crate with types (SnapshotId, ChunkKind, ChunkKey, ChunkRecord, StoreSource, StoreDebug, StoreHit, StoreCapabilities, StoreHealth, StoreError) and traits (StoreBackend, ChunkStore, LexicalStore, VectorStore, GraphStore).
+- **Materialization gate** (`materialize_evidence`): Critical gate that converts StoreHit → Evidence by: (0) reject empty content_sha, (1) validate_path (symlink protection), (2) read file bytes once; compute content_sha from same bytes (TOCTOU-safe), (3) reject stale hits (sha mismatch), (4) decode same bytes for line content; validate range (1 ≤ start ≤ end ≤ total_lines), (5) build excerpt from decoded content, (6) return Evidence with freshness=VerifiedCurrent. Store backends never directly output authoritative Evidence.
+- **ConservativeChunkStore**: In-memory ephemeral implementation (mode=ephemeral_in_memory, persistent=false) with metadata=true, chunks=true, lexical=false, vector=false, graph=false. Build validates paths via validate_path, skips stale records (content_sha mismatch), skips empty files (no start=1,end=0 invalid chunks), computes content_sha from same bytes used for line splitting. Does not walk filesystem itself.
+- **TdbPlaceholderStore**: Level 0 test surface implementing StoreBackend with available=false, success=false, mode=placeholder, and all capabilities false. Returns clear error messages ("feature 'tdb' is not enabled"). Does not add triviumdb as a dependency.
+- **CLI**: Added `openlocus store status/build/purge conservative|tdb --json`. JSON output includes mode, persistent, and success fields. All commands append trace events.
+- **Eval**: Added `eval/storage_bakeoff.py` with report_kind="storage_level0_smoke". Uses positional backend syntax.
+
+### R3 Level0 conformance results
+
+| Check | Result |
+|---|---|
+| Conservative build from scan_repo | ✅ chunks, files, valid ranges |
+| Conservative capabilities explicit | ✅ metadata+chunks only |
+| Conservative skips stale records | ✅ test passes |
+| Conservative skips empty files (no invalid chunks) | ✅ test passes |
+| Conservative skips traversal records | ✅ test passes |
+| Conservative purge | ✅ clears all data |
+| TDB status returns available=false, success=false | ✅ |
+| TDB build returns error, not panic | ✅ |
+| TDB purge returns error, not panic | ✅ |
+| Materialize rejects empty content_sha | ✅ test passes |
+| Materialize rejects stale hit | ✅ test passes |
+| Materialize rejects invalid range | ✅ test passes |
+| Materialize produces citation-valid Evidence | ✅ test passes |
+| Materialize TOCTOU-safe (sha + excerpt from same read) | ✅ test passes |
+| Ingest only from scan_repo records | ✅ store never walks filesystem |
+| Unknown backend returns error | ✅ |
+
+### Key findings
+
+1. The materialization gate is essential and works correctly: empty sha rejected, stale hits rejected, invalid ranges rejected, and produced Evidence is citation-valid (verified_current freshness, correct content_sha, excerpt from current file).
+2. TOCTOU safety matters: reading file bytes once and deriving both sha and excerpt from that single read prevents a file modification between sha computation and excerpt extraction from producing inconsistent evidence.
+3. ConservativeChunkStore validates paths and skips stale/invalid records: traversal paths are rejected, stale content_sha records are skipped, empty files produce no invalid chunks.
+4. TDB placeholder provides a clean Level 0 test surface: CLI commands return JSON with available=false, success=false, and descriptive errors rather than panicking or silently failing.
+5. All ingest comes from scan_repo filtered records; stores never walk the filesystem. Policy filtering is automatically respected.
+
+### Caveats carried forward
+
+- ConservativeChunkStore is in-memory ephemeral only; data does not persist across CLI invocations. A persistent index (e.g. sidecar file) would be needed for production use.
+- TDB placeholder does not exercise any actual TriviumDB code; it only validates the API shape. When a real adapter is needed, it should be behind a feature flag with an optional dependency.
+- VectorStore and GraphStore traits are defined but not implemented; they are placeholders for R4+ experimentation.
+- The store does not yet integrate with BM25 search; BM25 still builds a fresh Tantivy index per query.
+- This is a Level0 storage scaffold, not a full storage bakeoff or TDB comparison. No real storage-backed retrieval quality comparison is claimed.

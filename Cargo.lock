@@ -838,6 +838,7 @@ dependencies = [
  "openlocus-core",
  "openlocus-repo",
  "openlocus-retrieval",
+ "openlocus-store",
  "serde",
  "serde_json",
  "toml",
@@ -883,6 +884,21 @@ dependencies = [
  "serde_json",
  "tantivy",
  "tempfile",
+]
+
+[[package]]
+name = "openlocus-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "openlocus-core",
+ "openlocus-repo",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

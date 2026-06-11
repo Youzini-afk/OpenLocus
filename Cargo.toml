@@ -4,6 +4,7 @@ members = [
   "crates/openlocus-core",
   "crates/openlocus-repo",
   "crates/openlocus-retrieval",
+  "crates/openlocus-store",
 ]
 resolver = "2"
 
