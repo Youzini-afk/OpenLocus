@@ -81,33 +81,33 @@ BM25 over bounded line chunks with line tightening will outperform plain regex f
 - **Symbol search** (`symbol_search.rs`): Simple heuristic regex-based symbol extraction for Rust/Python/TS/JS/Go. Returns narrow single-line Evidence around the signature/head. Uses Channel::Regex with why="simple_symbol: {name}". Fills meta.symbol with name + kind. Language-aware pattern filtering prevents cross-language false matches. Word-boundary delimiters prevent partial matches (e.g. "User" won't match "UserProfile").
 - **RRF fusion** (`rrf.rs`): Combines evidence from multiple channels using Reciprocal Rank Fusion (k=60). Exact same (path, start_line, end_line) → merge why/score/channels. Overlapping spans on same path → keep narrower, discard wider. The wider's why, channels, and RRF score are merged into the narrower survivor (no span widening). Tie-break: score desc, path asc, start_line asc, end_line asc. RRF only changes ranking/score, never widens spans.
 - **CLI**: Added `search bm25 <query>`, `search symbol <query>`, `retrieve <query> --channels regex,bm25,symbol --max-results N`. All new commands append trace events.
-- **Eval**: Updated `run_retrieval.py` to accept `--method regex|text|bm25|symbol|rrf`, `--channels` for RRF. Updated `score.py` with structural_validity + citation_validity (true file I/O validation), FileRecall@1/5/10, FilePrecision@5/10, MRR, LinePrecision@10, LineRecall@10, SpanF0.5@10, token_waste_ratio@10, wrong_span_rate@10 (gold-file-only), zero_overlap_evidence_rate@10 (all evidence). Added `fixtures/r2.jsonl` with 28 tasks, gold spans refreshed to current codebase.
+- **Eval**: Updated `run_retrieval.py` to accept `--method regex|text|bm25|symbol|rrf`, `--channels` for RRF. Updated `score.py` with structural_validity + citation_validity, FileRecall@1/5/10, FilePrecision@5/10, MRR, LinePrecision@10, LineRecall@10, SpanF0.5@10, token_waste_ratio@10, wrong_span_rate@10 (gold-file-only), zero_overlap_evidence_rate@10 (all evidence). Python scorer verifies path/range and verifies BLAKE3 hashes when optional Python `blake3` is installed; Rust CLI validator is used for hash/excerpt-backed citation checks. Added `fixtures/r2.jsonl` with 28 tasks, gold spans refreshed to current codebase.
 
 ### R2 eval results (after oracle review fixes)
 
 | Metric | regex | bm25 | symbol | rrf |
 |---|---|---|---|---|
-| file_recall@1 | 0.21 | **0.46** | 0.39 | **0.46** |
-| file_recall@5 | 0.50 | **0.86** | 0.39 | **0.86** |
-| file_recall@10 | 0.57 | **0.93** | 0.39 | **0.93** |
-| mrr | 0.33 | 0.64 | 0.39 | **0.64** |
-| line_precision@10 | 0.07 | 0.06 | **0.39** | 0.08 |
-| line_recall@10 | 0.02 | 0.06 | 0.01 | 0.05 |
-| span_f0.5@10 | 0.04 | 0.06 | 0.06 | **0.07** |
+| file_recall@1 | 0.21 | **0.39** | **0.39** | **0.39** |
+| file_recall@5 | 0.36 | **0.86** | 0.39 | 0.82 |
+| file_recall@10 | 0.50 | **0.86** | 0.39 | 0.82 |
+| mrr | 0.29 | **0.58** | 0.39 | 0.56 |
+| line_precision@10 | 0.06 | 0.04 | **0.39** | 0.06 |
+| line_recall@10 | 0.01 | **0.04** | 0.01 | 0.04 |
+| span_f0.5@10 | 0.04 | 0.04 | **0.06** | 0.06 |
 | structural_validity | **1.0** | **1.0** | **1.0** | **1.0** |
 | citation_validity | **1.0** | **1.0** | **1.0** | **1.0** |
-| wrong_span_rate@10 | 0.79 | 0.77 | **0.0** | 0.78 |
-| zero_overlap@10 | 0.90 | 0.92 | **0.0** | 0.92 |
-| avg_latency_ms† | 12 | 131 | 168 | 274 |
+| wrong_span_rate@10 | 0.77 | 0.80 | **0.0** | 0.76 |
+| zero_overlap@10 | 0.92 | 0.95 | **0.0** | 0.93 |
+| avg_latency_ms† | 18 | 145 | 272 | 421 |
 
 † CLI end-to-end latency including index build (BM25/RRF) or file scan (symbol). Not a warm-index benchmark.
 
 ### Key findings
 
-1. BM25 substantially improves file-level recall on the current self-referential fixture (0.46 vs 0.21 at k=1, 0.86 vs 0.50 at k=5). This is an early local-only bakeoff result, not a general benchmark claim.
+1. BM25 substantially improves file-level recall on the current self-referential fixture (0.39 vs 0.21 at k=1, 0.86 vs 0.36 at k=5). This is an early local-only bakeoff result, not a general benchmark claim.
 2. Symbol search has the highest line precision (0.39) and zero wrong spans when it fires, but only activates for definition-style queries on known languages.
-3. RRF fusion recovers BM25-level file recall (0.86 at k=5) while incorporating symbol precision, achieving the best SpanF0.5@10 (0.07) in this fixture.
-4. All methods produce citation-valid evidence (1.0 structural + true citation validity).
+3. RRF fusion approaches BM25-level file recall (0.82 at k=5) while incorporating symbol precision, achieving 0.057 SpanF0.5@10 in this fixture.
+4. All methods produce structurally citation-valid evidence in the Python scorer. Current aggregated R2 output was also validated by `openlocus citations validate` with `0` invalid citations (hash/range/excerpt checked).
 5. Token waste ratio remains high (~0.92) — evidence spans are narrow but often miss gold lines. Query-token line scoring fixed chunk-center anchoring, but chunking/query expansion/gold-span calibration need further refinement.
 6. BM25 stale check and no-overlap skip are effective: no stale or center-only hits appear in the output.
 7. Symbol boundary delimiters prevent partial matches (verified: "User" does not match "UserProfile").
@@ -119,7 +119,7 @@ BM25 over bounded line chunks with line tightening will outperform plain regex f
 - **BM25 query fallback**: Removed `*` all-doc fallback; parse failures now degrade to sanitized query or empty results.
 - **Symbol boundary**: Added `(?:[^a-zA-Z0-9_]|$)` delimiter after symbol name in all patterns. Prevents partial matches.
 - **RRF overlap dedup**: Wider span's why/channels/score are now merged into the narrower survivor. Deterministic tie-break: score desc, path asc, start_line asc, end_line asc.
-- **Eval citation validity**: Split into `structural_validity` (no I/O) and `citation_validity` (verifies path exists and range/hash match current file). Added `--repo-root`.
+- **Eval citation validity**: Split into `structural_validity` (no I/O) and `citation_validity` (path/range by default; hash check when optional Python `blake3` is installed). Added `--repo-root`. For hash/excerpt-backed validation, use `openlocus citations validate`.
 - **Eval metrics**: Added `zero_overlap_evidence_rate@10` (all evidence, not just gold-file). `wrong_span_rate@10` now only counts evidence on gold files. Added `--channels` to `run_retrieval.py`.
 - **Fixtures**: Refreshed gold spans to current codebase actual line numbers.
 

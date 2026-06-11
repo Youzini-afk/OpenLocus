@@ -4,7 +4,8 @@
 Computes:
 - structural_validity: fraction of evidence with valid path, content_sha, line range.
 - citation_validity: fraction of evidence where path exists, range is in-bounds,
-  and content_sha matches the current file hash.
+  and, when the optional Python `blake3` package is installed, content_sha
+  matches the current file hash.
 - FileRecall@1/5/10, FilePrecision@5/10, MRR
 - LinePrecision@10, LineRecall@10, SpanF0.5@10
 - token_waste_ratio@10, wrong_span_rate@10, zero_overlap_evidence_rate@10
@@ -20,10 +21,9 @@ Metric semantics:
 from __future__ import annotations
 
 import argparse
-import hashlib
+import importlib
 import json
 from pathlib import Path
-from typing import Optional
 
 
 def load_predictions(path: str) -> list[dict]:
@@ -271,8 +271,22 @@ def structural_validity(predictions: list[dict]) -> float:
     return valid / total if total else 0.0
 
 
-def citation_validity(predictions: list[dict], repo_root: str) -> float:
-    """True citation validity: verify path exists, range in-bounds, content_sha matches."""
+def load_blake3():
+    """Load optional Python blake3 module for hash-backed citation checks."""
+    try:
+        return importlib.import_module("blake3")
+    except ImportError:
+        return None
+
+
+def citation_validity(predictions: list[dict], repo_root: str, blake3_mod=None) -> float:
+    """Citation validity for Python eval.
+
+    Always verifies path existence and line range bounds. If the optional Python
+    `blake3` package is installed, also verifies content_sha against current
+    file bytes. For unconditional hash/excerpt validation, use the Rust CLI:
+    `openlocus citations validate`.
+    """
     total = 0
     valid = 0
     root = Path(repo_root)
@@ -299,8 +313,6 @@ def citation_validity(predictions: list[dict], repo_root: str) -> float:
             except OSError:
                 continue
 
-            # Compute blake3 hash (we can't call blake3 from Python easily,
-            # so we use a simple check: read lines and verify range)
             try:
                 text = content.decode("utf-8")
             except UnicodeDecodeError:
@@ -313,18 +325,11 @@ def citation_validity(predictions: list[dict], repo_root: str) -> float:
             if end > total_lines:
                 continue
 
-            # Verify content_sha: we compute blake3 using the same method
-            # Since Python blake3 may not be installed, we just check file exists
-            # and range is valid. If blake3 is available, we verify the hash.
-            try:
-                import blake3 as _blake3
-
-                computed_sha = _blake3.blake3(content).hexdigest()
+            # Verify content_sha when optional Python blake3 is available.
+            if blake3_mod is not None:
+                computed_sha = blake3_mod.blake3(content).hexdigest()
                 if computed_sha != sha:
                     continue
-            except ImportError:
-                # Without blake3, we can only verify structure + range + file existence
-                pass
 
             valid += 1
 
@@ -370,6 +375,7 @@ def main() -> None:
     args = parser.parse_args()
 
     predictions = load_predictions(args.pred)
+    blake3_mod = load_blake3()
 
     if not predictions:
         print(json.dumps({"error": "no predictions"}, indent=2))
@@ -392,8 +398,14 @@ def main() -> None:
     # Structural validity (no file I/O needed)
     metrics["structural_validity"] = structural_validity(predictions)
 
-    # True citation validity (requires file I/O)
-    metrics["citation_validity"] = citation_validity(predictions, args.repo_root)
+    # Citation validity (hash-backed when optional Python blake3 is available).
+    metrics["citation_validity"] = citation_validity(
+        predictions, args.repo_root, blake3_mod
+    )
+    metrics["citation_hash_checked"] = blake3_mod is not None
+    metrics["citation_validation_mode"] = (
+        "path_range_hash" if blake3_mod is not None else "path_range_only"
+    )
 
     # If dataset provided, compute retrieval metrics
     if args.dataset:
