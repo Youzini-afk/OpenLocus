@@ -1,14 +1,14 @@
-# OpenLocus R0-R11 Research Report
+# OpenLocus R0-R12 Research Report
 
 Date: 2026-06-11  
 Repository: `https://github.com/Youzini-afk/OpenLocus.git`  
-Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R11 TriviumDB/TDB feature-gated Level0 adapter probe milestone.
+Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R12 real-repo incremental robustness benchmark milestone.
 
 ## Executive summary
 
 OpenLocus now has a working Rust prototype that validates the core design direction: **all agent-facing code facts must be evidence-backed, citation-checkable, and freshness-aware**.
 
-The implementation completed eleven evidence-gated checkpoints:
+The implementation completed twelve evidence-gated checkpoints:
 
 | Commit | Stage | Result |
 |---|---|---|
@@ -23,6 +23,7 @@ The implementation completed eleven evidence-gated checkpoints:
 | R9 checkpoint | R9 AST quality bakeoff | Persistent BM25 quality comparison: line vs ast on R2 fixture. AST improves span precision but regresses FileRecall@5. |
 | R10 checkpoint | R10 incremental index + dirty summary + synthetic SLO | Dirty summary (manifest-vs-current scan), file-level incremental update, context-lite dirty integration, synthetic 1000-file SLO benchmark. 48/48 incremental smoke checks passed. |
 | R11 checkpoint | R11 TDB Level0 adapter probe | Feature-gated TriviumDB 0.7.0 adapter behind `tdb` Cargo feature. TdbChunkStore with dim=1 smoke probe, metadata+chunks only, marker-based purge, materialization conformance. 11/11 adapter checks passed. No default dependency. No retrieval quality claim. |
+| R12 checkpoint | R12 real-repo incremental robustness benchmark | eval/real_repo_incremental_bench.py on temp copy of OpenLocus repo. modify/add/delete/rename/policy_exclude/batch workloads pass 149/149 hard safety checks. total_invalid_citations=0. No stale VerifiedCurrent violations. Growth catastrophic guard passed (not bounded proof). Latency measured as report-only. Level0 one real-repo sample only. |
 
 Final verification snapshot:
 
@@ -33,7 +34,7 @@ clippy: clean with -D warnings
 Remote dependency: none
 LLM dependency: none
 TDB dependency: optional only (behind `tdb` feature; not in default build)
-Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed; incremental index smoke 48/48 checks passed; synthetic SLO bench 0 invalid citations; TDB adapter probe 11/11 checks passed
+Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed; incremental index smoke 48/48 checks passed; synthetic SLO bench 0 invalid citations; TDB adapter probe 11/11 checks passed; real-repo incremental bench 149/149 hard safety checks passed
 ```
 
 The most important research outcome is not that retrieval quality is solved. It is that the project now has a **safe experimental harness** where BM25, graph, TDB, LLM-derived views, dense embeddings, and future planners can be tested without weakening the EvidenceCore contract.
@@ -451,11 +452,70 @@ Key finding:
 
 Status: passed Level0 smoke (11/11 adapter checks; 29/29 total store tests with --features tdb).
 
+### R12 — real-repo incremental robustness benchmark
+
+Goal: test R10 incremental index on a real repository copy (OpenLocus) with modify/add/delete/rename/policy-exclude/batch workloads, latency comparison, and growth cycling. Do not change Rust core, default CLI/search/retrieve, or introduce watcher/daemon/TDB changes.
+
+Implemented:
+
+- `eval/real_repo_incremental_bench.py` with `report_kind=real_repo_incremental_bench`.
+- Source repo defaults to current working directory; copies to temp repo (excluding `target`, `.git`, `.openlocus`, `runs`, `node_modules`, `dist`, `__pycache__`, etc.), creates empty `.git/` and `.openlocus/policy.toml`.
+- All workload file mutations occur only in temp repo; original source files are never modified. `--out` writes report to caller workspace.
+- **Per-run unique markers** (8-hex-char suffix) avoid self-contamination from copied docs/scripts. Pre-build assert confirms markers absent.
+- All search uses `openlocus search bm25 <query> --index persistent --json`. Search returncode must be 0 for positive gates.
+- Collected marker-search evidence is validated via `openlocus citations validate` with `invalid_count=0` and validator returncode==0.
+- **Positive gates use path+marker conjunction**: `evidence_has_path_and_marker` requires both path fragment AND marker in the cited excerpt. Previous disjunction could pass from unrelated evidence.
+- **Empty evidence is not a pass**: Where a marker must be found, `len(evidence) > 0` required.
+- Eight workloads: modify_one, add_one, delete_one, rename_one, policy_exclude, branch_like_batch, latency_compare, growth_cycles.
+- **Latency compare uses twin repo copies**: Both update and rebuild start from same state with same mutation. Gate is report-only; false does not cause exit failure.
+- **Growth catastrophic guard**: `final_after_updates_size ≤ max(3 × post_full_rebuild_size, post_full_rebuild_size + 64MiB)`. Observed 20-cycle growth ratio reported. Does not prove long-term bounded growth.
+- `sys.exit(1)` on safety failure only; latency/growth gate failures are report-only.
+
+R12 benchmark results (OpenLocus temp copy):
+
+| Check | Result |
+|---|---|
+| Baseline build succeeds, file/chunk count >0 | ✅ |
+| Baseline dirty clean after build | ✅ |
+| Baseline validate valid | ✅ |
+| modify_one: dirty detects modified | ✅ |
+| modify_one: update succeeds, new marker found at path+marker, old gone | ✅ |
+| modify_one: clean + valid after update | ✅ |
+| add_one: dirty detects added, search finds marker at path+marker | ✅ |
+| add_one: clean + valid after update | ✅ |
+| delete_one: dirty detects deleted, no VerifiedCurrent for deleted | ✅ |
+| delete_one: clean + valid after update | ✅ |
+| rename_one: dirty detects added+deleted, old gone, new found at path+marker | ✅ |
+| rename_one: clean + valid after update | ✅ |
+| policy_exclude: dirty stays clean, no evidence from excluded path | ✅ |
+| branch_batch: add target found at path+marker | ✅ |
+| branch_batch: rename-new target found at path+marker | ✅ |
+| branch_batch: delete/rename-old markers were indexed before removal | ✅ |
+| branch_batch: deleted path no VerifiedCurrent | ✅ |
+| branch_batch: rename-old path no VerifiedCurrent | ✅ |
+| branch_batch: clean + valid after update | ✅ |
+| growth_cycles: all cycles dirty→update→clean→valid | ✅ |
+| growth_cycles: catastrophic guard passed (observed ~1.11×) | ✅ |
+| total_invalid_citations | 0 |
+| stale_verified_current_violations | [] |
+
+Key finding:
+
+- Real-repo incremental update passes this Level0 temp-copy workload: no stale VerifiedCurrent evidence, correct dirty detection for sampled workload types, valid collected marker-search citations, catastrophic growth guard passed.
+- Per-run unique markers avoid self-contamination from copied docs/scripts. Pre-build assert confirms markers absent.
+- Positive gates require path+marker conjunction; empty evidence is not a pass for positive assertions.
+- Latency comparison uses twin repo copies (same mutation, same starting state); incremental update ~42% faster on this sample. Gate is report-only.
+- Growth catastrophic guard passed (20 cycles observed growth ~1.11×). Does not prove long-term bounded growth.
+- This is one real-repo sample (OpenLocus temp copy). Not a general performance or robustness claim. Different repos, hardware, and workloads may produce different results.
+- Collected marker-search evidence validated; not "all evidence in repo".
+
+Status: 149/149 hard safety checks passed; latency/growth gates measured honestly (report-only). Level0 one real-repo sample only.
+
 ## Cross-stage findings
 
 ### 1. EvidenceCore stayed stable
 
-R0-R11 did not require changing the core evidence contract. Research features were added around it:
+R0-R11 did not require changing the core evidence contract. R12 also did not change it. Research features were added around it:
 
 - storage uses StoreHit candidates;
 - derived indexing uses DerivedIndexView;
@@ -465,6 +525,7 @@ R0-R11 did not require changing the core evidence contract. Research features we
 - AST chunking/symbol extraction only changes candidate boundaries; it still materializes final Evidence from current filesystem validation.
 - Incremental update uses Tantivy delete-by-term + re-add with the same materialization path; no new evidence bypass.
 - TDB adapter uses chunk metadata in JSON payloads with dim=1 smoke probe; materialization still goes through StoreHit.
+- Real-repo benchmark uses temp copy of OpenLocus; all evidence still goes through the same materialization and citation validation path.
 
 This validates the original “small and hard” contract design.
 
@@ -539,7 +600,8 @@ This prototype is intentionally not production-ready.
 - Fast Context is fixed-rule orchestration, not adaptive planning.
 - Token budget uses chars/4 approximation, not a tokenizer.
 - Policy globbing is simple and needs a mature matcher before broad use.
-- Warm-index SLO now has Level0 synthetic measurement only; larger real-repo behavior is still unknown.
+- Warm-index SLO now has Level0 synthetic measurement and real-repo measurement; larger and more diverse repo behavior is still unknown.
+- R12 real-repo benchmark uses one repo (OpenLocus temp copy) with per-run unique alphanumeric markers; not a general performance claim. Growth catastrophic guard passed (observed 20-cycle ~1.11×); does not prove long-term bounded growth.
 
 ## Recommended next research stages
 
@@ -553,24 +615,30 @@ Gate:
 
 - conformance tests pass ✅;
 - corruption/purge/rebuild behavior understood ✅ (marker-based purge, refuses without marker);
-- quality/latency/resource comparison against conservative track — deferred to future R12+ bakeoff.
+- quality/latency/resource comparison against conservative track — deferred to future R13+ bakeoff.
 
-### R12 — real-repo incremental robustness benchmark
+### R12 — real-repo incremental robustness benchmark ✅ DONE
 
-Priority: high.
+Priority: high. **Completed in R12.**
 
-R10 proved a Level0 synthetic incremental loop. The next indexing-specific stage should test real repositories and branch/change workloads:
+R10 proved a Level0 synthetic incremental loop. R12 tested one real repository sample with modify/add/delete/rename/policy-exclude/batch workloads:
 
-- dirty/update latency on multiple real repos;
-- branch switch behavior;
-- crash/recovery around Tantivy commit vs manifest write;
-- tombstone/segment growth and optional compaction.
+- `eval/real_repo_incremental_bench.py` on temp copy of OpenLocus;
+- all sampled workloads pass hard safety gates (no stale VerifiedCurrent, correct dirty detection, valid collected marker-search citations);
+- per-run unique markers avoid self-contamination;
+- positive gates require path+marker conjunction (not disjunction);
+- latency compare uses twin repo copies (same mutation, report-only gate);
+- growth catastrophic guard (observed 20-cycle ~1.11×; does not prove long-term bounded growth);
+- sys.exit(1) on safety failure only; latency/growth gates report-only;
+- total_invalid_citations=0;
+- Level0 one real-repo sample only; not general performance claim.
 
 Gate:
 
-- no stale VerifiedCurrent evidence;
-- update path remains faster than full rebuild for small edits;
-- dirty status remains honest under adds/deletes/renames/excludes.
+- no stale VerifiedCurrent evidence ✅;
+- update path remains faster than full rebuild for small edits — measured honestly via twin repos (report-only gate);
+- dirty status remains honest under adds/deletes/renames/excludes ✅;
+- collected marker-search evidence validated; not "all evidence in repo".
 
 ### R13 — remote embedding and LLM-derived indexing bakeoffs
 
@@ -625,6 +693,7 @@ The current implementation successfully converts the research design into a work
 - AST vs line quality bakeoff with measurable span precision improvement;
 - incremental index with dirty summary and file-level update;
 - feature-gated TriviumDB Level0 adapter probe;
+- real-repo incremental robustness benchmark (modify/add/delete/rename/policy-exclude/batch/latency/growth);
 - pushed checkpoints for each stage.
 
-The next phase should not rush into a full LLM/dense/TDB system. The safest path is to first ensure incremental index is robust on real repos (R10 complete), then extend TDB to meaningful search quality (R11 adapter probe complete), plug in dense vectors and LLM-derived views into the same evidence-gated harness, and run bakeoffs against the conservative baseline.
+The next phase should not rush into a full LLM/dense/TDB system. The safest path is to continue testing incremental robustness on more real repositories (R12 completed one OpenLocus temp-copy sample), then extend TDB to meaningful search quality (R11 adapter probe complete), plug in dense vectors and LLM-derived views into the same evidence-gated harness, and run bakeoffs against the conservative baseline.

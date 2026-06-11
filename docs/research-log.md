@@ -864,3 +864,143 @@ TriviumDB 0.7.0 (from crates.io) can be used as an optional dependency behind a 
 - TDB is not integrated with the RRF retrieval pipeline or fast-context orchestration.
 - The `TdbPlaceholderStore` still exists and reports `available=false` regardless of whether the `tdb` feature is enabled. A future iteration could make the placeholder aware of the feature flag.
 - Warm/persistent query benchmark not yet run against the TDB adapter (not meaningful until search is implemented).
+
+---
+
+## 2026-06-11 — R12 Real-Repo Incremental Robustness Benchmark
+
+### Objective
+
+Add a real-repo sample benchmark using a safe temporary copy of the current OpenLocus repository to test R10 incremental index's real-scenario robustness. Do not change Rust core, default CLI/search/retrieve, and do not introduce watcher/daemon/TDB changes.
+
+### Current hypothesis
+
+R10 proved incremental update works on a synthetic 1000-file repo. A real repo with mixed file types, larger files, and real code patterns should also pass all safety gates (no stale VerifiedCurrent evidence, correct dirty detection, valid citations). Incremental update should be faster than full rebuild for small edits on a real repo.
+
+### Implementation notes
+
+- **New eval script**: `eval/real_repo_incremental_bench.py` with `report_kind=real_repo_incremental_bench`.
+- **Source repo**: defaults to current working directory; copies to temp repo excluding `target`, `.git`, `.openlocus`, `runs`, `node_modules`, `dist`, `__pycache__`, etc. Creates empty `.git/` and `.openlocus/policy.toml` in temp repo.
+- **All workload file mutations only in temp repo**: original source files are never modified. `--out` writes report to caller workspace.
+- **Per-run unique markers**: Each run generates a random 8-hex-char suffix (e.g. `a3f7b2c1`). All markers are concatenated with this suffix (e.g. `r12addalphaa3f7b2c1`). Before baseline build, `assert_markers_absent` scans the temp repo to confirm no marker self-contamination from copied docs/scripts.
+- **All search**: `openlocus search bm25 <query> --index persistent --json`. Search returncode must be 0 for positive gates.
+- **Collected marker-search evidence validation**: `openlocus citations validate <file> --json` with `invalid_count=0` and validator returncode==0.
+- **Positive gates use path+marker conjunction**: `evidence_has_path_and_marker` requires BOTH the target relative path AND the marker in the cited excerpt. Disjunction (path OR marker) is not used for positive assertions.
+- **Empty evidence is not a pass for positive gates**: Where a marker must be found, `len(evidence) > 0` is required.
+- **`sys.exit(1)` on safety failure**: `all_safety_checks_passed` false exits with code 1. Latency/growth gate false does NOT cause exit failure.
+- **Latency comparison uses twin repo copies**: For each iteration, two fresh copies of the source repo are made. Same mutation is applied to both; one gets `update --dirty`, the other gets `build`. This ensures fair comparison of the same final state.
+- **Growth gate renamed to catastrophic guard**: `growth_catastrophic_guard_passed` (not "bounded proof"). Observed 20-cycle growth ratio reported separately. The catastrophic bound (max(3×rebuild, rebuild+64MiB)) is a backstop, not proof of long-term bounded growth.
+- **Branch-like batch checks are specific**: At least one add target path+marker AND one rename-new target path+marker must be found. At least one deleted path and one rename-old path must have no VerifiedCurrent evidence.
+
+### Script CLI
+
+```bash
+python3 eval/real_repo_incremental_bench.py \
+  --openlocus target/debug/openlocus \
+  --source /workspace/OpenLocus/OpenLocus \
+  --out runs/real-repo-incremental-bench.json \
+  --iterations 3 \
+  --growth-cycles 20
+```
+
+Optional `--keep-temp` to preserve temp repo after benchmark.
+
+### Workloads
+
+A. **modify_one**: Append per-run marker to existing file; dirty detects modified; search old marker has no VerifiedCurrent for modified path; update; new marker found at path with marker in evidence (path AND marker); old marker gone; clean + valid + citations invalid_count=0.
+
+B. **add_one**: Add `r12_bench/r12_add_target_{sfx}.rs` with per-run marker; dirty detects added; update; search finds marker at path with marker in evidence; clean + valid + citations invalid_count=0.
+
+C. **delete_one**: Delete `r12_bench/r12_delete_target_{sfx}.rs`; dirty detects deleted; update; search marker no VerifiedCurrent for deleted path; clean + valid + citations invalid_count=0.
+
+D. **rename_one**: Rename `r12_rename_old_{sfx}.rs` → `r12_rename_new_{sfx}.rs` + change marker; dirty detects added+deleted; update; old gone (no VerifiedCurrent for old path); new found at new path with marker (path AND marker); clean + valid + citations invalid_count=0.
+
+E. **policy_exclude**: Add `.env.r12bench{sfx}` with marker; dirty stays clean; no evidence from excluded path (path-aware check).
+
+F. **branch_like_batch**: Batch add 5 + delete 3 + rename 3; old delete/rename markers are first proven indexed; dirty covers categories; update; add target 0 found at path+marker; rename-new target 0 found at path+marker; deleted path 0 no VerifiedCurrent; rename-old path 0 no VerifiedCurrent; clean + valid + citations invalid_count=0.
+
+G. **latency_compare**: Twin repo copies per iteration; same mutation applied; compare `update --dirty` vs `build` for modify_one and batch. Gate: p50 update < p50 rebuild. If false, report only; does not cause exit failure.
+
+H. **growth_cycles**: N cycles of modify same file + update. Each cycle: dirty detects modified, update succeeds, dirty clean, validate valid. Catastrophic guard: `final_after_updates_size <= max(3 * post_full_rebuild_size, post_full_rebuild_size + 64MiB)`. Observed growth ratio reported. This is a catastrophic guard, not proof of long-term bounded growth.
+
+### R12 results (after per-run marker + safety gate fixes)
+
+| Check | Result |
+|---|---|
+| Baseline markers absent pre-build (no self-contamination) | ✅ |
+| Baseline build succeeds, file/chunk count >0 | ✅ |
+| Baseline dirty clean after build | ✅ |
+| Baseline validate valid | ✅ |
+| modify_one: dirty detects modified | ✅ |
+| modify_one: update succeeds | ✅ |
+| modify_one: new marker found at path+marker | ✅ |
+| modify_one: old marker gone (no VerifiedCurrent for path) | ✅ |
+| modify_one: clean + valid after update | ✅ |
+| add_one: dirty detects added | ✅ |
+| add_one: search finds marker at path+marker | ✅ |
+| add_one: clean + valid after update | ✅ |
+| delete_one: dirty detects deleted | ✅ |
+| delete_one: no VerifiedCurrent for deleted path | ✅ |
+| delete_one: clean + valid after update | ✅ |
+| rename_one: dirty detects added + deleted | ✅ |
+| rename_one: old gone, new found at path+marker | ✅ |
+| rename_one: clean + valid after update | ✅ |
+| policy_exclude: dirty stays clean | ✅ |
+| policy_exclude: no evidence from excluded path | ✅ |
+| branch_batch: add target 0 found at path+marker | ✅ |
+| branch_batch: rename-new target 0 found at path+marker | ✅ |
+| branch_batch: deleted/rename-old markers indexed before removal | ✅ |
+| branch_batch: deleted path 0 no VerifiedCurrent | ✅ |
+| branch_batch: rename-old path 0 no VerifiedCurrent | ✅ |
+| branch_batch: clean + valid after update | ✅ |
+| growth_cycles: all cycles dirty→update→clean→valid | ✅ |
+| growth_cycles: catastrophic guard passed | ✅ |
+| total_invalid_citations | 0 |
+| stale_verified_current_violations | [] |
+
+### Latency compare (twin repo copies, same mutation)
+
+| Scenario | Update p50 (ms) | Rebuild p50 (ms) | Update faster? |
+|---|---|---|---|
+| modify_one | 96.2 | 165.8 | ✅ yes |
+| branch_like_batch | 99.7 | 169.4 | ✅ yes |
+
+Incremental update is ~42% faster than full rebuild for both single-file and batch modifications on this real-repo sample (75 files, 804 chunks, dev profile). Latency gate is report-only; false does not cause exit failure.
+
+### Growth result
+
+| Metric | Value |
+|---|---|
+| Size after 20 update cycles | ~905 KB |
+| Size after full rebuild | ~823 KB |
+| Observed growth ratio | 1.11 |
+| Catastrophic guard (≤ max(3×rebuild, rebuild+64MiB)) | ✅ passed |
+
+20 cycles observed growth ~1.11×; catastrophic guard passed. Does not prove long-term bounded growth.
+
+### Safety checks
+
+149/149 hard safety checks passed. Script exits with code 1 if any hard safety check fails; latency/growth gate failures are report-only.
+
+### Key findings
+
+1. **Real-repo incremental update passes this Level0 sample**: On a temp copy of the OpenLocus repository (mixed Rust, Python, TypeScript, Markdown files), incremental update correctly handles sampled modify, add, delete, rename, policy-excluded, and batch workloads. No stale VerifiedCurrent evidence is produced.
+2. **Citation validity is maintained for collected marker-search evidence**: Evidence validated through `openlocus citations validate` has `invalid_count=0` and validator returncode==0.
+3. **Per-run unique markers avoid self-contamination**: Fixed markers appeared in copied docs/scripts, causing false positives. Per-run suffixes (8-hex chars) and pre-build assert prevent this.
+4. **Positive gates use path+marker conjunction**: Previous `evidence_has_path_or_marker` (disjunction) could pass from unrelated evidence. New `evidence_has_path_and_marker` requires both path and marker in the cited excerpt of the same evidence item.
+5. **Empty evidence is not a pass for positive gates**: Previous code could pass add/rename checks with empty evidence returning `invalid_citations=0`. Now requires `len(evidence) > 0`.
+6. **Latency comparison uses twin repo copies**: Previous code compared update on a dirty repo vs rebuild on a clean repo (unfair). Now both start from the same state with the same mutation applied.
+7. **Growth gate is honestly named as catastrophic guard**: 20 cycles observed growth ~1.11×; catastrophic guard passed. This does not prove long-term bounded growth.
+8. **This is one real-repo sample (OpenLocus temp copy)**: Not a general performance claim. Different repos, hardware, and workloads may produce different results.
+
+### Caveats
+
+- This is a Level0 real-repo sample benchmark using one repo (OpenLocus temp copy). Not a general performance or robustness claim.
+- Per-run unique markers avoid self-contamination but are not representative of real search queries.
+- The temp repo excludes `.git` history; real repos with large git histories may behave differently in scan time.
+- Tantivy deletes are tombstones until merge; index size after many updates may be larger than a fresh rebuild. The catastrophic guard bounds extreme growth but does not prove bounded growth.
+- The latency comparison uses CLI wall-clock time which includes process startup overhead. Internal Rust timing would be more precise.
+- No concurrent access testing; single-process only.
+- No crash/recovery testing between Tantivy commit and manifest write.
+- Branch-like batch does not actually switch git branches; it simulates the file-level effects of a branch switch.
+- Collected marker-search evidence is validated; this is not "all evidence in repo" — only evidence from workload-specific marker searches.
