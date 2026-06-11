@@ -577,3 +577,88 @@ AST-bounded chunks should improve retrieval precision by aligning chunk boundari
 - No incremental update for AST index; `build_index` is always a full rebuild.
 - Manifest schema version `r8-bm25-v2` is not compatible with `r7-bm25-v1` for search purposes (older schemas load but may require rebuild for search).
 - AST chunking adds Tree-sitter as a dependency, increasing binary size and compile time.
+
+## 2026-06-11 — R9 AST vs Line Persistent BM25 Quality Bakeoff
+
+### Objective
+
+Evaluate `index build --chunk-strategy line` vs `--chunk-strategy ast` persistent BM25 retrieval quality on the R2 self-referential fixture. Produce a reproducible script and research log. Do not change EvidenceCore, default behaviour, or implement incremental indexing.
+
+### Hypothesis
+
+AST-bounded chunks should improve span-level precision/recall (SpanF0.5@10) by aligning chunk boundaries with logical code structures, but the effect may be small or negative on this small self-referential fixture. File-level recall may not improve because AST chunking changes span boundaries, not file-level ranking.
+
+### R9 bakeoff results (persistent BM25 on fixtures/r2.jsonl, 28 tasks)
+
+| Metric | line | ast | delta |
+|---|---:|---:|---:|
+| FileRecall@1 | 0.393 | 0.536 | +0.143 |
+| FileRecall@5 | 0.821 | 0.786 | −0.036 |
+| FileRecall@10 | 0.821 | 0.821 | 0.000 |
+| MRR | 0.556 | 0.631 | +0.075 |
+| SpanF0.5@10 | 0.040 | 0.065 | +0.025 |
+| token_waste_ratio@10 | 0.960 | 0.938 | −0.022 |
+| wrong_span_rate@10 | 0.780 | 0.693 | −0.086 |
+| zero_overlap_evidence_rate@10 | 0.950 | 0.913 | −0.038 |
+| citation_validity | 1.0 | 1.0 | 0.0 |
+| structural_validity | 1.0 | 1.0 | 0.0 |
+| success_rate | 1.0 | 1.0 | 0.0 |
+| avg_latency_ms | ~10.9 | ~10.3 | noisy/comparable |
+| latency_ratio | — | ~1.0 | noisy |
+
+### Quality gate
+
+| Gate condition | Result |
+|---|---|
+| Both citation_validity == 1.0 | ✅ |
+| Both success_rate == 1.0 | ✅ |
+| AST FileRecall@5 ≥ line | ❌ (0.786 < 0.821) |
+| AST SpanF0.5@10 ≥ line | ✅ (0.065 > 0.040) |
+| AST token_waste not worse | ✅ (0.938 < 0.960) |
+| Latency ratio ≤ 1.25 | ✅ (comparable; latest run ~0.94) |
+| **Overall quality_gate_passed** | **false** (FileRecall@5 regression) |
+
+### Safety checks
+
+| Safety check | Result |
+|---|---|
+| Line build succeeds | ✅ |
+| AST build succeeds | ✅ |
+| Line validate valid | ✅ |
+| AST validate valid | ✅ |
+| Line status strategy=line | ✅ |
+| AST status strategy=ast | ✅ |
+| Evidence nonempty (both) | ✅ |
+| Citation validator invalid_count=0 (both) | ✅ |
+| Search stats counters present/nonnegative (both) | ✅ |
+| Build strategy explicit (both) | ✅ |
+| **All safety checks passed** | **true** |
+
+### Key findings
+
+1. **AST improves SpanF0.5@10 by +0.025** (0.040 → 0.065, +62% relative). AST-bounded chunks align better with logical code structures, producing evidence spans that overlap gold lines more often. This is the strongest positive signal for AST chunking.
+2. **AST improves FileRecall@1 by +0.143** (0.393 → 0.536, +36% relative). The finer-grained AST chunks appear to help top-1 file retrieval, likely because more specific chunks match queries more precisely at the top rank.
+3. **AST regresses FileRecall@5 by −0.036** (0.821 → 0.786). This is the quality gate failure. AST chunking produces more, smaller chunks (e.g., 15 chunks vs 5 for a 5-file repo), which can dilute BM25 scores for some files, causing them to rank outside top-5. This is a real trade-off: finer chunks help precision at k=1 but may hurt recall at higher k because the same file's chunks compete with each other.
+4. **AST reduces token_waste_ratio@10 by −0.022** (0.960 → 0.938). Narrower, more targeted evidence spans waste fewer tokens on irrelevant lines. The improvement is modest on this fixture.
+5. **AST reduces wrong_span_rate@10 by −0.086** (0.780 → 0.693). AST-bounded evidence on gold files is more likely to overlap gold spans, reducing the rate of evidence that hits the right file but the wrong location.
+6. **Latency is comparable/noisy** (latest ratio ~0.94). Both strategies have similar per-query latency in this tiny CLI benchmark; this is not a general performance claim.
+7. **Citation validity and structural validity are perfect for both strategies** (1.0). AST chunking does not compromise evidence safety.
+8. **Quality gate is false** due to FileRecall@5 regression. This is a negative result on the gate but not on safety. The gate correctly captures the trade-off.
+
+### Interpretation
+
+**AST remains experimental/opt-in. Line remains default.**
+
+The R9 bakeoff shows a mixed picture: AST improves span precision (SpanF0.5, token waste, wrong_span_rate) and top-1 recall (FileRecall@1, MRR), but regresses FileRecall@5. On this small self-referential fixture, the trade-off is real but the magnitude is small. The regression at FileRecall@5 likely reflects chunk-score dilution: more granular AST chunks can scatter a file's BM25 signal across many smaller chunks, reducing the chance that any single chunk ranks the file into the top-5.
+
+Whether this trade-off is acceptable depends on the use case: for top-1 precision and span quality, AST is preferable; for broad file discovery at k=5+, line chunking is more conservative. The fixture is too small and self-referential to generalise these findings. A larger, diverse codebase eval would be needed to determine whether AST chunking provides a consistent quality improvement.
+
+### Caveats
+
+- Fixture is R2 small self-referential (28 tasks, ~20 source files). Results are not generalisable.
+- FileRecall@5 regression may be an artifact of chunk granularity on small repos; larger repos may not exhibit the same trade-off.
+- No incremental indexing; bakeoff rebuilds the full index for each strategy.
+- The bakeoff only tests persistent BM25; temp BM25, RRF, and fast-context are not compared here.
+- token_waste_ratio remains high (~0.94) for both strategies. The bottleneck is query-evidence alignment, not chunking strategy.
+- Python citation validation uses path_range_only mode (no blake3 Python package installed); Rust CLI citation validator confirmed invalid_count=0 for both strategies.
+- AST mode is experimental and opt-in. Line-window chunking remains the default and recommended strategy.

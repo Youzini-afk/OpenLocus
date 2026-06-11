@@ -1,8 +1,8 @@
-# OpenLocus R0-R8 Research Report
+# OpenLocus R0-R9 Research Report
 
 Date: 2026-06-11  
 Repository: `https://github.com/Youzini-afk/OpenLocus.git`  
-Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R8 AST chunking and symbol extraction milestone.
+Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R9 AST quality bakeoff milestone.
 
 ## Executive summary
 
@@ -20,6 +20,7 @@ The implementation completed eight evidence-gated milestones:
 | `fb7104e` | R6 fast context prototype | 4-turn deterministic context orchestration with EvidencePack-compatible output. |
 | `43135ed` | R7 persistent BM25 index | Persistent Tantivy index with mandatory manifest/policy gates, safe hit validation, and warm benchmark. |
 | R8 checkpoint | R8 AST chunking/symbols | Tree-sitter AST-bounded chunking and AST symbol search as explicit experimental modes. |
+| R9 checkpoint | R9 AST quality bakeoff | Persistent BM25 quality comparison: line vs ast on R2 fixture. AST improves span precision but regresses FileRecall@5. |
 
 Final verification snapshot:
 
@@ -30,7 +31,7 @@ clippy: clean with -D warnings
 Remote dependency: none
 LLM dependency: none
 TDB dependency: none (placeholder only)
-Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates
+Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed
 ```
 
 The most important research outcome is not that retrieval quality is solved. It is that the project now has a **safe experimental harness** where BM25, graph, TDB, LLM-derived views, dense embeddings, and future planners can be tested without weakening the EvidenceCore contract.
@@ -311,11 +312,50 @@ Critical gates:
 
 Status: passed Level0 smoke (`40/40`) and full Rust tests (`176`). AST quality lift is **not proven** yet; this is an experimental scaffold.
 
+### R9 — AST vs line persistent BM25 quality bakeoff
+
+Goal: measure whether AST-bounded chunking improves persistent BM25 retrieval quality compared to default line-window chunking.
+
+Implemented:
+
+- `eval/ast_quality_bakeoff.py`: Reproducible bakeoff script that runs both strategies (purge/build/search/score) on the R2 fixture and produces a combined JSON report with metrics, delta, quality gate, and safety checks.
+- Directly reuses `eval/score.py` functions (file_recall_at_k, mrr, span_f_beta_at_k, token_waste_ratio_at_k, citation_validity, etc.) instead of duplicating scoring logic.
+- Predictions written as JSONL compatible with `eval/score.py` format.
+- Quality gate: citation_validity==1.0 and success_rate==1.0 for both; AST FileRecall@5 ≥ line; AST SpanF0.5@10 ≥ line; token_waste not worse; latency ratio ≤ 1.25.
+- Safety checks: build succeeds, validate valid, status strategy matches, emitted evidence nonempty, citation validator invalid_count=0, search stats counters present/nonnegative, strategy explicit.
+- Gate and safety are reported separately. Negative results are valid; script does not exit failure on quality gate false.
+
+R2 fixture results (28 tasks, persistent BM25):
+
+| Metric | line | ast | delta |
+|---|---:|---:|---:|
+| FileRecall@1 | 0.393 | 0.536 | +0.143 |
+| FileRecall@5 | 0.821 | 0.786 | −0.036 |
+| FileRecall@10 | 0.821 | 0.821 | 0.000 |
+| MRR | 0.556 | 0.631 | +0.075 |
+| SpanF0.5@10 | 0.040 | 0.065 | +0.025 |
+| token_waste_ratio@10 | 0.960 | 0.938 | −0.022 |
+| wrong_span_rate@10 | 0.780 | 0.693 | −0.086 |
+| citation_validity | 1.0 | 1.0 | 0.0 |
+| avg_latency_ms | ~10.9 | ~10.3 | noisy/comparable |
+| latency_ratio | — | ~1.0 | — |
+
+Quality gate: **false** (AST FileRecall@5 < line).  
+Safety checks: **16/16 passed**.
+
+Key finding:
+
+- AST improves span precision (SpanF0.5@10 +62% relative, token_waste −2.2pp, wrong_span_rate −8.6pp) and top-1 recall (+36% relative), but regresses FileRecall@5 (−3.6pp) due to chunk-score dilution: more granular AST chunks scatter a file's BM25 signal, reducing the chance that any single chunk ranks the file into top-5.
+- This is a real trade-off, not a bug. The fixture is too small and self-referential to generalise.
+- **AST remains experimental/opt-in; line remains default.** A larger, diverse codebase eval would be needed for a definitive quality comparison.
+
+Status: safety checks all pass; quality gate is false due to FileRecall@5 regression. This is a valid negative result on a small self-referential fixture.
+
 ## Cross-stage findings
 
 ### 1. EvidenceCore stayed stable
 
-R0-R8 did not require changing the core evidence contract. Research features were added around it:
+R0-R9 did not require changing the core evidence contract. Research features were added around it:
 
 - storage uses StoreHit candidates;
 - derived indexing uses DerivedIndexView;
@@ -386,7 +426,7 @@ This prototype is intentionally not production-ready.
 - ConservativeChunkStore is in-memory and ephemeral.
 - TDB is a placeholder only; no real TriviumDB code is linked.
 - LLM indexing is a deterministic safety scaffold only; no real model/provider is used.
-- AST chunking/symbol extraction is experimental; no quality lift has been proven yet.
+- AST chunking/symbol extraction is experimental; R9 bakeoff shows span precision improvement but FileRecall@5 regression on the small fixture. AST remains opt-in.
 - Graph parsing is heuristic and line-based; no LSP/SCIP graph yet.
 - Config graph edges are noisy.
 - Fast Context is fixed-rule orchestration, not adaptive planning.
@@ -400,11 +440,10 @@ This prototype is intentionally not production-ready.
 
 Priority: high.
 
-Compare AST vs line chunk strategies on retrieval quality, then extend persistent indexes from full rebuild to incremental updates and run warm/cold SLO measurements on larger repositories.
+**R9 partial completion**: AST vs line quality bakeoff completed (see R9 stage results above). AST improves SpanF0.5@10 and FileRecall@1 but regresses FileRecall@5 on the small fixture. AST remains experimental/opt-in; line remains default. Remaining R9 work: extend persistent indexes from full rebuild to incremental updates and run warm/cold SLO measurements on larger repositories.
 
-Gate:
+Gate (incrementality part, still pending):
 
-- AST mode improves SpanF0.5/token waste or remains experimental only;
 - dirty overlay/update p95 near P0 target;
 - no stale verified evidence after edit/delete/rename;
 - branch switch does not mix stale manifests;
@@ -472,6 +511,7 @@ The current implementation successfully converts the research design into a work
 - file-backed citation validation;
 - retrieval method bakeoff harness;
 - storage, derived-index, graph, persistent-index, and fast-context safety scaffolds;
+- AST vs line quality bakeoff with measurable span precision improvement;
 - pushed checkpoints for each stage.
 
-The next phase should not rush into a full LLM/dense/TDB system. The safest path is to first make the local baseline AST-aware and incrementally maintained, then plug TDB, dense vectors, and LLM-derived views into the same evidence-gated harness.
+The next phase should not rush into a full LLM/dense/TDB system. The safest path is to first make the local baseline incrementally maintained (R9 remaining work), then plug TDB, dense vectors, and LLM-derived views into the same evidence-gated harness.
