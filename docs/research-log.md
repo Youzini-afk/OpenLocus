@@ -786,3 +786,81 @@ Note: These are Level0 synthetic-only measurements on a deterministic 1000-file 
 - Skipped entries (empty files, read errors, path_unsafe) are tracked in the manifest; they do not appear as "added" on subsequent dirty scans if sha is unchanged. A skipped→nonempty transition is reported as "modified" and the update promotes it to "indexed".
 - R7/R8/R9 smoke tests still pass after R10 changes.
 - TDB moves to a later research stage (was R10 in original roadmap, now deferred to R11).
+
+---
+
+## 2026-06-11 — R11 TriviumDB/TDB Feature-Gated Level0 Adapter Probe
+
+### Objective
+
+Implement a feature-gated TriviumDB (TDB) adapter behind a `tdb` Cargo feature, proving the StoreBackend / ChunkStore trait hierarchy can be wired to a real TDB instance. This is a Level0 adapter probe for metadata/chunk persistence only — not a retrieval quality claim. If the TDB crate was not compilable or its API was unsuitable, the fallback was a negative feasibility report.
+
+### Current hypothesis
+
+TriviumDB 0.7.0 (from crates.io) can be used as an optional dependency behind a Cargo feature flag to store chunk metadata as JSON payloads in TDB nodes with dim=1 dummy vectors. The adapter should pass the same build discipline as ConservativeChunkStore (validate_path, TOCTOU-safe sha, skip stale/traversal/empty) and honestly report capabilities (metadata+chunks only, no lexical/vector/graph claims). TDB hits must go through StoreHit → materialize_evidence(); they cannot directly become Evidence.
+
+### Implementation notes
+
+- **Cargo feature**: Added `[features] default = []` and `tdb = ["dep:triviumdb"]` to `crates/openlocus-store/Cargo.toml`. Added `triviumdb = { version = "=0.7.0", optional = true }`. Workspace/default build does NOT enable the feature; `cargo test --workspace` does not compile or require TriviumDB.
+- **TdbChunkStore** (`crates/openlocus-store/src/tdb_adapter.rs`): Behind `#[cfg(feature = "tdb")]`.
+  - Opens a `Database<f32>` with `dim=1` and stores chunk metadata as JSON payloads with schema `openlocus_schema=tdb_chunk_v1`.
+  - The vector `[0.0]` is a smoke probe only — this is NOT vector quality. Documentation explicitly states this.
+  - Payload schema: `openlocus_schema`, `path`, `start_line`, `end_line`, `content_sha`, `language`, `kind`.
+  - Build discipline copies ConservativeChunkStore: `validate_path`, read current bytes once, sha from same bytes, skip stale/traversal/empty invalid chunks; line chunks OK.
+  - Uses `db.insert(&[0.0f32], payload)` with auto-assigned NodeIds. In-memory `ChunkRecord` list maintained for conformance.
+  - Capabilities: metadata=true, chunks=true, lexical=false, vector=false, graph=false.
+  - Marker file (`.openlocus_marker`) written alongside the `.tdb` file to identify adapter-owned data.
+  - Purge only deletes the adapter-owned TDB artifact set (`.tdb` plus known sidecars) after verifying the marker. Refuses purge if marker is missing or mismatched.
+  - Ingest only from `scan_repo` filtered records; never walks filesystem itself.
+  - If adapter exposes hits, they must be converted to `StoreHit` and go through `materialize_evidence()`.
+- **Module registration**: `#[cfg(feature = "tdb")] pub mod tdb_adapter;` in `lib.rs`.
+- **Placeholder preserved**: `TdbPlaceholderStore` (always available) unchanged — it still reports `available=false` when the `tdb` feature is not enabled.
+
+### R11 Level0 adapter probe results
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace` (default, no tdb) | ✅ 193 passed |
+| `cargo test -p openlocus-store --features tdb` | ✅ 28 passed (18 existing + 10 new adapter) |
+| `cargo fmt --all -- --check` | ✅ clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| `cargo clippy -p openlocus-store --features tdb -- -D warnings` | ✅ clean |
+| TDB adapter health available when open | ✅ |
+| TDB adapter build from records | ✅ chunks, files, valid ranges |
+| TDB adapter capabilities conservative | ✅ metadata+chunks only, no lexical/vector/graph |
+| TDB adapter skips stale records | ✅ test passes |
+| TDB adapter skips empty files (no invalid chunks) | ✅ test passes |
+| TDB adapter skips traversal records | ✅ test passes |
+| TDB adapter purge marker-owned only | ✅ deletes .tdb + known sidecars + marker |
+| TDB adapter purge refuses without marker | ✅ error with marker/refused |
+| TDB adapter materialization conformance | ✅ StoreHit → materialize_evidence → VerifiedCurrent |
+| TDB adapter materialization rejects stale | ✅ StaleHit |
+| TDB adapter materialization rejects empty sha | ✅ error |
+| TDB adapter materialization rejects invalid range | ✅ error |
+| Default build unchanged | ✅ no TDB dependency in default |
+| Placeholder unchanged | ✅ TdbPlaceholderStore preserved |
+| EvidenceCore unchanged | ✅ |
+| No default dependency on triviumdb | ✅ optional only |
+
+### Key findings
+
+1. **TriviumDB 0.7.0 compiles and works**: The crate from crates.io compiles with the workspace's Rust edition (2024) and toolchain. `Database::open(path, dim=1)` creates/opens a database; `db.insert(&[0.0f32], payload)` inserts nodes with JSON payloads; `db.flush()` persists to disk.
+2. **Feature-gated adapter works correctly**: The `tdb` feature flag cleanly gates the adapter. Default builds do not compile or require TriviumDB. The adapter module is only included when the feature is enabled.
+3. **Build discipline is preserved**: The TDB adapter follows the same ConservativeChunkStore discipline — validate_path, TOCTOU-safe sha computation, stale/traversal/empty skipping. This ensures consistent behavior across store backends.
+4. **dim=1 is a smoke probe, not vector quality**: The adapter explicitly does not claim vector search capability. The `[0.0]` vector is used solely to satisfy TDB's API requirement. Capabilities honestly report vector=false.
+5. **Marker-based purge is safe**: The adapter writes a marker file alongside the `.tdb` file. Purge verifies the marker before deletion and refuses to delete paths without a valid marker. This prevents accidental deletion of arbitrary files.
+6. **Materialization conformance is enforced**: TDB chunk records are converted to StoreHit and must go through `materialize_evidence()`. Stale, empty-sha, and invalid-range hits are correctly rejected.
+7. **TDB is NOT a default backend**: The adapter is feature-gated and opt-in. TDB does not replace Tantivy persistent BM25 or the conservative store. The placeholder store continues to report unavailability when the feature is not enabled.
+8. **This is a Level0 adapter probe**: No retrieval quality claim is made. The adapter proves wiring and persistence; it does not provide meaningful lexical, vector, or graph search through TDB.
+
+### Caveats
+
+- This is a Level0 adapter probe only. No retrieval quality comparison against Tantivy BM25 or conservative store.
+- The TDB adapter uses auto-assigned NodeIds (via `db.insert()`). The `insert_with_id` API exists but requires predetermined IDs; this is a possible future enhancement for deterministic chunk IDs.
+- The TDB adapter does not implement `LexicalStore`, `VectorStore`, or `GraphStore`. It only provides `StoreBackend` + `ChunkStore`.
+- TDB file locking prevents multiple processes from opening the same database simultaneously (by design in TriviumDB).
+- Chunk insert and flush failures now fail the Level0 build instead of silently claiming persistence success.
+- No CLI integration for TDB adapter in this R11 iteration. The adapter is only usable programmatically.
+- TDB is not integrated with the RRF retrieval pipeline or fast-context orchestration.
+- The `TdbPlaceholderStore` still exists and reports `available=false` regardless of whether the `tdb` feature is enabled. A future iteration could make the placeholder aware of the feature flag.
+- Warm/persistent query benchmark not yet run against the TDB adapter (not meaningful until search is implemented).

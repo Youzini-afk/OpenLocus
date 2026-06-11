@@ -1,10 +1,10 @@
 //! TDB (TriviumDB) placeholder store.
 //!
 //! This implements `StoreBackend` but returns `available=false` for all
-//! operations. It is a Level 0 test surface: the API shape is defined,
-//! but no actual TDB dependency is used. When the `tdb` feature is
-//! eventually enabled with a real dependency, this placeholder will be
-//! replaced with an actual adapter.
+//! operations. It is a Level 0 default-path test surface: the API shape is
+//! defined, but no actual TDB dependency is used. The real adapter lives in a
+//! separate `tdb_adapter` module behind the optional `tdb` Cargo feature; this
+//! placeholder remains the default behavior when that feature is disabled.
 //!
 //! Important: TDB/TriviumDB is NOT a default dependency. This placeholder
 //! exists solely to validate the store trait API against an "unavailable"

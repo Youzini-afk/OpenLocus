@@ -10,6 +10,8 @@
 //! filesystem themselves.
 
 pub mod conservative;
+#[cfg(feature = "tdb")]
+pub mod tdb_adapter;
 pub mod tdb_placeholder;
 
 use openlocus_core::{Channel, Evidence, Freshness, ScoreParts};

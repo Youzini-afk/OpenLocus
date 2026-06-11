@@ -1,14 +1,14 @@
-# OpenLocus R0-R10 Research Report
+# OpenLocus R0-R11 Research Report
 
 Date: 2026-06-11  
 Repository: `https://github.com/Youzini-afk/OpenLocus.git`  
-Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R10 incremental index + dirty summary + synthetic SLO milestone.
+Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R11 TriviumDB/TDB feature-gated Level0 adapter probe milestone.
 
 ## Executive summary
 
 OpenLocus now has a working Rust prototype that validates the core design direction: **all agent-facing code facts must be evidence-backed, citation-checkable, and freshness-aware**.
 
-The implementation completed ten evidence-gated checkpoints:
+The implementation completed eleven evidence-gated checkpoints:
 
 | Commit | Stage | Result |
 |---|---|---|
@@ -22,6 +22,7 @@ The implementation completed ten evidence-gated checkpoints:
 | R8 checkpoint | R8 AST chunking/symbols | Tree-sitter AST-bounded chunking and AST symbol search as explicit experimental modes. |
 | R9 checkpoint | R9 AST quality bakeoff | Persistent BM25 quality comparison: line vs ast on R2 fixture. AST improves span precision but regresses FileRecall@5. |
 | R10 checkpoint | R10 incremental index + dirty summary + synthetic SLO | Dirty summary (manifest-vs-current scan), file-level incremental update, context-lite dirty integration, synthetic 1000-file SLO benchmark. 48/48 incremental smoke checks passed. |
+| R11 checkpoint | R11 TDB Level0 adapter probe | Feature-gated TriviumDB 0.7.0 adapter behind `tdb` Cargo feature. TdbChunkStore with dim=1 smoke probe, metadata+chunks only, marker-based purge, materialization conformance. 11/11 adapter checks passed. No default dependency. No retrieval quality claim. |
 
 Final verification snapshot:
 
@@ -31,8 +32,8 @@ fmt: clean
 clippy: clean with -D warnings
 Remote dependency: none
 LLM dependency: none
-TDB dependency: none (placeholder only)
-Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed; incremental index smoke 48/48 checks passed; synthetic SLO bench 0 invalid citations
+TDB dependency: optional only (behind `tdb` feature; not in default build)
+Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed; incremental index smoke 48/48 checks passed; synthetic SLO bench 0 invalid citations; TDB adapter probe 11/11 checks passed
 ```
 
 The most important research outcome is not that retrieval quality is solved. It is that the project now has a **safe experimental harness** where BM25, graph, TDB, LLM-derived views, dense embeddings, and future planners can be tested without weakening the EvidenceCore contract.
@@ -401,11 +402,60 @@ Key finding:
 
 Status: passed Level0 smoke (48/48 incremental checks + synthetic SLO).
 
+### R11 — TriviumDB/TDB feature-gated Level0 adapter probe
+
+Goal: implement a real TriviumDB adapter behind a Cargo feature flag, proving the StoreBackend / ChunkStore trait hierarchy can be wired to a live TDB instance. If TDB was not compilable, fall back to a negative feasibility report.
+
+Implemented:
+
+- **Cargo feature**: `tdb = ["dep:triviumdb"]` in `openlocus-store/Cargo.toml`. `triviumdb = { version = "=0.7.0", optional = true }`. Default build does NOT enable the feature.
+- **TdbChunkStore** (`crates/openlocus-store/src/tdb_adapter.rs`): Behind `#[cfg(feature = "tdb")]`.
+  - Opens `Database<f32>` with `dim=1` and stores chunk metadata as JSON payloads with schema `openlocus_schema=tdb_chunk_v1`.
+  - The `[0.0]` vector is a smoke probe only — NOT vector quality. Capabilities honestly report vector=false.
+  - Build discipline copies ConservativeChunkStore: `validate_path`, read current bytes once, sha from same bytes, skip stale/traversal/empty.
+  - Marker file (`.openlocus_marker`) written alongside `.tdb` for adapter ownership identification.
+  - Purge only deletes the adapter-owned TDB artifact set (`.tdb` plus known sidecars) after verifying the marker. Refuses without valid marker.
+  - Ingest only from `scan_repo` filtered records; never walks filesystem.
+  - TDB hits must go through `StoreHit → materialize_evidence()`.
+- **Placeholder preserved**: `TdbPlaceholderStore` unchanged.
+
+R11 Level0 adapter probe results:
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace` (default, no tdb) | ✅ 193 passed |
+| `cargo test -p openlocus-store --features tdb` | ✅ 28 passed |
+| `cargo fmt --all -- --check` | ✅ clean |
+| `cargo clippy --workspace -- -D warnings` | ✅ clean |
+| `cargo clippy -p openlocus-store --features tdb -- -D warnings` | ✅ clean |
+| TDB adapter health available when open | ✅ |
+| TDB adapter build from records | ✅ |
+| TDB adapter capabilities conservative | ✅ metadata+chunks only |
+| TDB adapter skips stale records | ✅ |
+| TDB adapter skips empty files | ✅ |
+| TDB adapter skips traversal records | ✅ |
+| TDB adapter purge marker-owned only | ✅ deletes `.tdb` + known sidecars + marker |
+| TDB adapter purge refuses without marker | ✅ |
+| TDB adapter materialization conformance | ✅ VerifiedCurrent |
+| TDB adapter materialization rejects stale | ✅ StaleHit |
+| TDB adapter materialization rejects empty sha | ✅ |
+| TDB adapter materialization rejects invalid range | ✅ |
+| Default build unchanged | ✅ no TDB dependency |
+| Placeholder unchanged | ✅ |
+| EvidenceCore unchanged | ✅ |
+
+Key finding:
+
+- TriviumDB 0.7.0 compiles from crates.io and works as an optional dependency. The feature-gated adapter correctly wires TDB into the StoreBackend/ChunkStore trait hierarchy with honest capability reporting. Materialization conformance is enforced.
+- This is a Level0 adapter probe only. No retrieval quality comparison against Tantivy BM25 or conservative store. The dim=1 vector is a smoke probe. TDB is NOT a default dependency.
+
+Status: passed Level0 smoke (11/11 adapter checks; 29/29 total store tests with --features tdb).
+
 ## Cross-stage findings
 
 ### 1. EvidenceCore stayed stable
 
-R0-R10 did not require changing the core evidence contract. Research features were added around it:
+R0-R11 did not require changing the core evidence contract. Research features were added around it:
 
 - storage uses StoreHit candidates;
 - derived indexing uses DerivedIndexView;
@@ -414,6 +464,7 @@ R0-R10 did not require changing the core evidence contract. Research features we
 - persistent BM25 uses Tantivy hits plus mandatory manifest/policy gates, then materializes from the current filesystem before output.
 - AST chunking/symbol extraction only changes candidate boundaries; it still materializes final Evidence from current filesystem validation.
 - Incremental update uses Tantivy delete-by-term + re-add with the same materialization path; no new evidence bypass.
+- TDB adapter uses chunk metadata in JSON payloads with dim=1 smoke probe; materialization still goes through StoreHit.
 
 This validates the original “small and hard” contract design.
 
@@ -464,9 +515,9 @@ source span + content_sha + provider/model/prompt/policy provenance
 
 The next LLM step should be a quality bakeoff on low-risk view kinds (`chunk_summary`, `symbol_tags`, `query_aliases`) with provider policy and audit logging, not free-form repository summaries.
 
-### 6. TDB should enter as an adapter, not as the data model
+### 6. TDB entered as an adapter, not as the data model
 
-The storage scaffold keeps TDB in scope while avoiding premature commitment. The first real TDB experiment should implement Store traits behind a feature flag and run the same conformance/materialization tests against it. It should not redefine EvidenceCore or become a default dependency before bakeoff proof.
+The storage scaffold kept TDB in scope while avoiding premature commitment. R11 implemented the first real TDB adapter behind a feature flag, running the same conformance/materialization tests. It did not redefine EvidenceCore or become a default dependency. The adapter is a Level0 probe with honest capability reporting (metadata+chunks only, no lexical/vector/graph quality).
 
 ## Current caveats
 
@@ -480,7 +531,7 @@ This prototype is intentionally not production-ready.
 - Dirty summary re-scans all indexed files (O(n)); filesystem watchers or mtime caching needed for very large repos.
 - Skipped entries (empty files, read errors, path_unsafe) are tracked in manifest; they do not appear as "added" on subsequent dirty scans if sha is unchanged.
 - ConservativeChunkStore is in-memory and ephemeral.
-- TDB is a placeholder only; no real TriviumDB code is linked.
+- TDB is a feature-gated Level0 adapter probe; not a default dependency. Real TriviumDB code is linked only when `--features tdb` is enabled.
 - LLM indexing is a deterministic safety scaffold only; no real model/provider is used.
 - AST chunking/symbol extraction is experimental; R9 bakeoff shows span precision improvement but FileRecall@5 regression on the small fixture. AST remains opt-in.
 - Graph parsing is heuristic and line-based; no LSP/SCIP graph yet.
@@ -492,17 +543,17 @@ This prototype is intentionally not production-ready.
 
 ## Recommended next research stages
 
-### R11 — real TDB adapter behind feature flag
+### R11 — real TDB adapter behind feature flag ✅ DONE
 
-Priority: medium-high.
+Priority: medium-high. **Completed in R11.**
 
-Implement actual TDB adapter for vector/graph/chunk experiments, but keep SQLite/Tantivy/conservative track as baseline.
+Implemented TDB adapter behind `tdb` feature flag. TdbChunkStore with dim=1 smoke probe, metadata+chunks only, marker-based purge, materialization conformance. 11/11 adapter checks passed. No default dependency. No retrieval quality claim.
 
 Gate:
 
-- conformance tests pass;
-- corruption/purge/rebuild behavior understood;
-- quality/latency/resource comparison against conservative track.
+- conformance tests pass ✅;
+- corruption/purge/rebuild behavior understood ✅ (marker-based purge, refuses without marker);
+- quality/latency/resource comparison against conservative track — deferred to future R12+ bakeoff.
 
 ### R12 — real-repo incremental robustness benchmark
 
@@ -573,6 +624,7 @@ The current implementation successfully converts the research design into a work
 - storage, derived-index, graph, persistent-index, and fast-context safety scaffolds;
 - AST vs line quality bakeoff with measurable span precision improvement;
 - incremental index with dirty summary and file-level update;
+- feature-gated TriviumDB Level0 adapter probe;
 - pushed checkpoints for each stage.
 
-The next phase should not rush into a full LLM/dense/TDB system. The safest path is to first ensure incremental index is robust on real repos (R10 complete), then plug TDB, dense vectors, and LLM-derived views into the same evidence-gated harness.
+The next phase should not rush into a full LLM/dense/TDB system. The safest path is to first ensure incremental index is robust on real repos (R10 complete), then extend TDB to meaningful search quality (R11 adapter probe complete), plug in dense vectors and LLM-derived views into the same evidence-gated harness, and run bakeoffs against the conservative baseline.
