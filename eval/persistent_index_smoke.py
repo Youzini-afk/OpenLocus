@@ -124,13 +124,13 @@ def main() -> None:
     safety_checks["build_succeeds"] = build.get("success") is True
     safety_checks["build_file_count_positive"] = build.get("file_count", 0) > 0
     safety_checks["build_chunk_count_positive"] = build.get("chunk_count", 0) > 0
-    safety_checks["build_schema_version"] = build.get("schema_version") == "r7-bm25-v1"
+    safety_checks["build_schema_version"] = build.get("schema_version") in ("r7-bm25-v1", "r8-bm25-v2")
     report["build"] = build
 
     # 3. Status check
     status = run_cmd([ol, "index", "status", "--json"], cwd)
     safety_checks["status_exists"] = status.get("exists") is True
-    safety_checks["status_schema_matches"] = status.get("schema_version") == "r7-bm25-v1"
+    safety_checks["status_schema_matches"] = status.get("schema_version") in ("r7-bm25-v1", "r8-bm25-v2")
     safety_checks["status_policy_hash_matches"] = status.get("policy_hash_matches") is True
     safety_checks["status_no_rebuild_needed"] = status.get("requires_rebuild") is not True
     report["status"] = status

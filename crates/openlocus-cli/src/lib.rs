@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use openlocus_ast::{AstSymbolKind, AstSymbolStatus, extract_ast_symbols};
 use openlocus_context::plan::{FastContextPlan, fast_context};
 use openlocus_core::{
     BudgetUsed, Channel, ContextLitePack, Evidence, EvidencePack, Freshness, JsonOutput, Policy,
-    TraceEvent, append_trace,
+    ScoreParts, Symbol, SymbolKind, TraceEvent, append_trace,
 };
 use openlocus_derived::generator;
 use openlocus_derived::model::{DerivedIndexView, DerivedViewKind};
@@ -12,6 +13,7 @@ use openlocus_derived::store::JsonlDerivedViewStore;
 use openlocus_derived::validation;
 use openlocus_graph::graph::{self, EdgeKind, GraphEdge};
 use openlocus_graph::materialize::materialize_graph_edges;
+use openlocus_index::manifest::ChunkStrategy;
 use openlocus_index::persistent::{
     PersistentBm25Index, build_index, purge_index, search_persistent_bm25, status_index,
     validate_index,
@@ -195,6 +197,9 @@ pub enum SearchCommands {
         /// Maximum results
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Search mode: regex, ast, or auto (ast first for supported files, regex fallback)
+        #[arg(long, default_value = "auto")]
+        mode: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -319,6 +324,9 @@ pub enum GraphCommands {
 pub enum IndexCommands {
     /// Build persistent BM25 index from scanned files
     Build {
+        /// Chunk strategy: line (fixed-size line windows) or ast (AST-bounded, experimental)
+        #[arg(long, default_value = "line")]
+        chunk_strategy: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -457,16 +465,59 @@ pub fn run() -> Result<()> {
                     print_output(&results, json)
                 }
             }
-            SearchCommands::Symbol { query, limit, json } => {
-                let records = scan_repo(&repo_root, &policy)?;
-                let results = symbol_search(&repo_root, &records, &query, limit)?;
-                trace_event(
-                    &repo_root,
-                    "search_symbol",
-                    serde_json::json!({"query": query, "limit": limit}),
-                    serde_json::json!({"result_count": results.len()}),
-                );
-                print_output(&results, json)
+            SearchCommands::Symbol {
+                query,
+                limit,
+                mode,
+                json,
+            } => {
+                match mode.as_str() {
+                    "regex" => {
+                        let records = scan_repo(&repo_root, &policy)?;
+                        let results = symbol_search(&repo_root, &records, &query, limit)?;
+                        trace_event(
+                            &repo_root,
+                            "search_symbol_regex",
+                            serde_json::json!({"query": query, "limit": limit, "mode": "regex"}),
+                            serde_json::json!({"result_count": results.len()}),
+                        );
+                        print_output(&results, json)
+                    }
+                    "ast" => {
+                        let records = scan_repo(&repo_root, &policy)?;
+                        let results = ast_symbol_search(&repo_root, &records, &query, limit)?;
+                        trace_event(
+                            &repo_root,
+                            "search_symbol_ast",
+                            serde_json::json!({"query": query, "limit": limit, "mode": "ast"}),
+                            serde_json::json!({"result_count": results.len()}),
+                        );
+                        print_output(&results, json)
+                    }
+                    _ => {
+                        // "auto": AST first, regex fallback
+                        let records = scan_repo(&repo_root, &policy)?;
+                        let ast_results = ast_symbol_search(&repo_root, &records, &query, limit)?;
+                        if !ast_results.is_empty() {
+                            trace_event(
+                                &repo_root,
+                                "search_symbol_auto",
+                                serde_json::json!({"query": query, "limit": limit, "mode": "auto", "used": "ast"}),
+                                serde_json::json!({"result_count": ast_results.len()}),
+                            );
+                            print_output(&ast_results, json)
+                        } else {
+                            let results = symbol_search(&repo_root, &records, &query, limit)?;
+                            trace_event(
+                                &repo_root,
+                                "search_symbol_auto",
+                                serde_json::json!({"query": query, "limit": limit, "mode": "auto", "used": "regex"}),
+                                serde_json::json!({"result_count": results.len()}),
+                            );
+                            print_output(&results, json)
+                        }
+                    }
+                }
             }
         },
         Commands::Retrieve {
@@ -873,13 +924,18 @@ pub fn run() -> Result<()> {
             print_output(&result, json)
         }
         Commands::Index { index_cmd } => match index_cmd {
-            IndexCommands::Build { json } => {
+            IndexCommands::Build {
+                chunk_strategy,
+                json,
+            } => {
+                let strategy = ChunkStrategy::from_cli_str(&chunk_strategy)
+                    .unwrap_or(ChunkStrategy::LineWindowV1);
                 let records = scan_repo(&repo_root, &policy)?;
-                let result = build_index(&repo_root, &records, &policy)?;
+                let result = build_index(&repo_root, &records, &policy, strategy)?;
                 trace_event(
                     &repo_root,
                     "index_build",
-                    serde_json::json!({}),
+                    serde_json::json!({"chunk_strategy": chunk_strategy}),
                     serde_json::json!({"success": result.success, "file_count": result.file_count, "chunk_count": result.chunk_count}),
                 );
                 print_output(&result, json)
@@ -1129,6 +1185,108 @@ struct StoreStatusResult {
     snapshot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+// ── AST symbol search helper ──────────────────────────────────────────
+
+/// AST-based symbol search. Uses Tree-sitter to extract symbols from
+/// supported language files. Returns narrow header/signature Evidence.
+/// For unsupported languages or parse errors, returns empty (callers
+/// should fall back to regex).
+fn ast_symbol_search(
+    repo_root: &Path,
+    records: &[openlocus_repo::scan::FileRecord],
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<Evidence>> {
+    let mut results = Vec::new();
+
+    for record in records {
+        if results.len() >= max_results {
+            break;
+        }
+
+        let full_path = match validate_path(repo_root, &record.path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let content_sha = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len() as u64;
+
+        let ast_result = extract_ast_symbols(&record.path, &record.language, &content);
+
+        // Only use results from supported AST parsing
+        if ast_result.status != AstSymbolStatus::Supported {
+            continue;
+        }
+
+        for sym in &ast_result.symbols {
+            if results.len() >= max_results {
+                break;
+            }
+
+            // Match symbol name against query (case-insensitive contains)
+            if !sym.name.to_lowercase().contains(&query.to_lowercase()) {
+                continue;
+            }
+
+            // Validate range
+            if sym.start_line < 1 || sym.end_line > total_lines || sym.start_line > sym.end_line {
+                continue;
+            }
+
+            let excerpt = lines[(sym.start_line - 1) as usize..sym.end_line as usize].join("\n");
+
+            let core_symbol_kind = match sym.kind {
+                AstSymbolKind::Function => SymbolKind::Function,
+                AstSymbolKind::Method => SymbolKind::Method,
+                AstSymbolKind::Class => SymbolKind::Class,
+                AstSymbolKind::Interface => SymbolKind::Interface,
+                AstSymbolKind::Type => SymbolKind::Type,
+                AstSymbolKind::Enum => SymbolKind::Type,
+                AstSymbolKind::Trait => SymbolKind::Interface,
+                AstSymbolKind::Module => SymbolKind::Module,
+                AstSymbolKind::Variable => SymbolKind::Variable,
+                AstSymbolKind::Constant => SymbolKind::Variable,
+                AstSymbolKind::Macro => SymbolKind::Function,
+                AstSymbolKind::Decorator => SymbolKind::Function,
+                AstSymbolKind::Unknown => SymbolKind::Unknown,
+            };
+
+            let evidence = Evidence::new(
+                &record.path,
+                sym.start_line,
+                sym.end_line,
+                &content_sha,
+                1.0,
+                vec![format!("ast_symbol: {}", sym.name)],
+                vec![Channel::TreeSitter],
+            )
+            .with_excerpt(&excerpt)
+            .with_language(&record.language)
+            .with_freshness(Freshness::VerifiedCurrent)
+            .with_symbol(Symbol {
+                name: sym.name.clone(),
+                kind: core_symbol_kind,
+                qualified_name: None,
+                symbol_id: None,
+            })
+            .with_score_parts(ScoreParts {
+                symbol: Some(1.0),
+                ..Default::default()
+            });
+
+            results.push(evidence);
+        }
+    }
+
+    Ok(results)
 }
 
 fn store_status(_repo_root: &Path, _policy: &Policy, backend: &str) -> Result<StoreStatusResult> {
@@ -1527,7 +1685,7 @@ fn run_bench_warm(
     if !status.exists || status.requires_rebuild {
         let build_start = Instant::now();
         let records = scan_repo(repo_root, policy)?;
-        let _build_result = build_index(repo_root, &records, policy)?;
+        let _build_result = build_index(repo_root, &records, policy, ChunkStrategy::LineWindowV1)?;
         index_build_ms = Some(build_start.elapsed().as_millis() as u64);
     }
 

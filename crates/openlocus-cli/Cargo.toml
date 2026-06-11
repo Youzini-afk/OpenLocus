@@ -15,6 +15,7 @@ anyhow.workspace = true
 blake3.workspace = true
 chrono.workspace = true
 clap.workspace = true
+openlocus-ast = { path = "../openlocus-ast" }
 openlocus-context = { path = "../openlocus-context" }
 openlocus-core = { path = "../openlocus-core" }
 openlocus-derived = { path = "../openlocus-derived" }

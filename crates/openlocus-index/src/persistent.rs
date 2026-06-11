@@ -3,17 +3,22 @@
 //! build_index: Full rebuild, writes Tantivy index + manifest.
 //! status_index: Quick check of index state.
 //! validate_index: Full validation of manifest entries against filesystem.
-//! purge_index: Safe deletion of R7 index artifacts.
+//! purge_index: Safe deletion of R7/R8 index artifacts.
 //! search_persistent_bm25: Search with mandatory re-verification of every hit.
 //!
-//! Safety gates (oracle review R7):
+//! Safety gates (oracle review R7 + R8):
 //! - Policy gate: search/validate refuse if manifest policy_hash ≠ current policy.
 //! - validate_path on every Tantivy hit path before reading file.
 //! - Empty index_content_sha → skip (cannot verify stale check).
 //! - chunk range strictly validated: 1 ≤ start ≤ end ≤ total_lines; no clamping.
 //! - build_index filters unsafe FileRecord paths via validate_path.
+//! - R8: chunk_strategy gate — search/validate refuse if manifest chunk_strategy
+//!   is unrecognized or missing; schema mismatch also triggers rebuild.
+//! - R8: AST chunks are only candidate boundaries; evidence still verified
+//!   from current filesystem path/range/hash/excerpt/freshness.
 
 use anyhow::{Context, Result, bail};
+use openlocus_ast::{AstChunkKind, AstStatus, extract_ast_chunks};
 use openlocus_core::{Channel, Evidence, Freshness, Policy, ScoreParts};
 use openlocus_repo::scan::FileRecord;
 use openlocus_repo::validate_path;
@@ -26,7 +31,7 @@ use tantivy::{Index, ReloadPolicy, doc};
 
 use crate::manifest::*;
 
-/// Maximum chunk size in lines for indexing.
+/// Maximum chunk size in lines for indexing (line-window strategy).
 const MAX_CHUNK_LINES: u64 = 30;
 /// Context lines around a matching center for tightened evidence.
 const CONTEXT_LINES: u64 = 2;
@@ -43,17 +48,25 @@ pub struct BuildResult {
     pub chunk_count: u64,
     pub schema_version: String,
     pub policy_hash: String,
+    pub chunk_strategy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_stats: Option<AstManifestStats>,
 }
 
 /// Build a persistent Tantivy BM25 index from file records.
 /// Writes the index to .openlocus/index/tantivy/ and manifest to .openlocus/index/manifest.json.
 /// This is a full rebuild — any existing index is replaced.
 ///
+/// `chunk_strategy` controls how source is chunked:
+/// - `line_window_v1` (default): fixed-size line windows, same as R7.
+/// - `ast_v1` (experimental): AST-bounded chunks with fallback line windows.
+///
 /// Safety: filters FileRecord paths through validate_path; unsafe paths are skipped.
 pub fn build_index(
     repo_root: &Path,
     records: &[FileRecord],
     policy: &Policy,
+    chunk_strategy: ChunkStrategy,
 ) -> Result<BuildResult> {
     let policy_hash = compute_policy_hash(policy);
 
@@ -84,6 +97,7 @@ pub fn build_index(
 
     let mut manifest_files = Vec::new();
     let mut total_chunks: u64 = 0;
+    let mut ast_stats = AstManifestStats::default();
 
     for record in records {
         // Path safety gate: validate_path before indexing
@@ -135,22 +149,64 @@ pub fn build_index(
             continue;
         }
 
-        // Index bounded chunks
-        let mut chunk_start = 0u64;
-        while chunk_start < total_lines {
-            let chunk_end = (chunk_start + MAX_CHUNK_LINES).min(total_lines);
-            let chunk_content = lines[chunk_start as usize..chunk_end as usize].join("\n");
+        // Determine chunks based on strategy
+        let chunks = match chunk_strategy {
+            ChunkStrategy::LineWindowV1 => {
+                // R7 line-window chunking
+                let mut chunks = Vec::new();
+                let mut chunk_start = 0u64;
+                while chunk_start < total_lines {
+                    let chunk_end = (chunk_start + MAX_CHUNK_LINES).min(total_lines);
+                    chunks.push((chunk_start + 1, chunk_end)); // 1-based
+                    chunk_start = chunk_end;
+                }
+                chunks
+            }
+            ChunkStrategy::AstV1 => {
+                // R8 AST-bounded chunking
+                let ast_result =
+                    extract_ast_chunks(&record.path, &record.language, &content, MAX_CHUNK_LINES);
+
+                // Track AST stats
+                match ast_result.status {
+                    AstStatus::Supported => ast_stats.supported_files += 1,
+                    AstStatus::FallbackUnsupported => ast_stats.fallback_files += 1,
+                    AstStatus::FallbackParseError => ast_stats.parser_error_files += 1,
+                }
+                for chunk in &ast_result.chunks {
+                    match chunk.kind {
+                        AstChunkKind::AstNode => ast_stats.ast_chunks += 1,
+                        AstChunkKind::FallbackLineWindow => ast_stats.fallback_chunks += 1,
+                    }
+                }
+
+                ast_result
+                    .chunks
+                    .iter()
+                    .map(|c| (c.start_line, c.end_line))
+                    .collect()
+            }
+        };
+
+        // Index each chunk
+        for (start_line, end_line) in &chunks {
+            let start_idx = (*start_line - 1) as usize;
+            let end_idx = *end_line as usize;
+            let chunk_content = if start_idx < lines.len() && end_idx <= lines.len() {
+                lines[start_idx..end_idx].join("\n")
+            } else {
+                continue; // Invalid range, skip
+            };
 
             index_writer.add_document(doc!(
                 path_field => record.path.as_str(),
                 language_field => record.language.as_str(),
                 content_sha_field => current_sha.as_str(),
-                start_line_field => chunk_start + 1,
-                end_line_field => chunk_end,
+                start_line_field => *start_line,
+                end_line_field => *end_line,
                 content_field => chunk_content.as_str(),
             ))?;
 
-            chunk_start = chunk_end;
             total_chunks += 1;
         }
 
@@ -166,8 +222,19 @@ pub fn build_index(
 
     index_writer.commit()?;
 
-    // Write manifest
-    let manifest = IndexManifest::new(policy_hash.clone(), manifest_files, total_chunks);
+    // Write manifest with chunk strategy
+    let ast_stats_opt = if chunk_strategy == ChunkStrategy::AstV1 {
+        Some(ast_stats)
+    } else {
+        None
+    };
+    let manifest = IndexManifest::new_with_strategy(
+        policy_hash.clone(),
+        manifest_files,
+        total_chunks,
+        chunk_strategy.clone(),
+        ast_stats_opt.clone(),
+    );
     manifest.save(repo_root)?;
 
     Ok(BuildResult {
@@ -176,6 +243,8 @@ pub fn build_index(
         chunk_count: total_chunks,
         schema_version: SCHEMA_VERSION.to_string(),
         policy_hash,
+        chunk_strategy: chunk_strategy.to_cli_str().to_string(),
+        ast_stats: ast_stats_opt,
     })
 }
 
@@ -193,6 +262,11 @@ pub struct StatusResult {
     /// Quick stale check: count of manifest files whose content_sha doesn't
     /// match current file. This is bounded by reading each file once.
     pub stale_files_fast: Option<u64>,
+    /// Chunk strategy from manifest.
+    pub chunk_strategy: Option<String>,
+    /// AST stats from manifest (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_stats: Option<AstManifestStats>,
 }
 
 /// Quick status check of the persistent index.
@@ -206,6 +280,8 @@ pub fn status_index(repo_root: &Path, policy: &Policy) -> Result<StatusResult> {
             policy_hash_matches: None,
             requires_rebuild: true,
             stale_files_fast: None,
+            chunk_strategy: None,
+            ast_stats: None,
         });
     }
 
@@ -214,7 +290,12 @@ pub fn status_index(repo_root: &Path, policy: &Policy) -> Result<StatusResult> {
     let current_policy_hash = compute_policy_hash(policy);
     let policy_hash_matches = manifest.policy_hash == current_policy_hash;
 
-    let schema_ok = manifest.schema_version == SCHEMA_VERSION;
+    let schema_ok =
+        manifest.schema_version == SCHEMA_VERSION || manifest.schema_version == SCHEMA_VERSION_R7;
+
+    // R8: chunk_strategy must be recognized
+    let strategy_ok = manifest.chunk_strategy == ChunkStrategy::LineWindowV1
+        || manifest.chunk_strategy == ChunkStrategy::AstV1;
 
     // Quick stale check: for each indexed file, check if content_sha matches current file
     let mut stale_count: u64 = 0;
@@ -237,7 +318,7 @@ pub fn status_index(repo_root: &Path, policy: &Policy) -> Result<StatusResult> {
     }
 
     let requires_rebuild =
-        !schema_ok || !policy_hash_matches || stale_count > 0 || deleted_count > 0;
+        !schema_ok || !policy_hash_matches || !strategy_ok || stale_count > 0 || deleted_count > 0;
 
     Ok(StatusResult {
         exists: true,
@@ -247,6 +328,8 @@ pub fn status_index(repo_root: &Path, policy: &Policy) -> Result<StatusResult> {
         policy_hash_matches: Some(policy_hash_matches),
         requires_rebuild,
         stale_files_fast: Some(stale_count + deleted_count),
+        chunk_strategy: Some(manifest.chunk_strategy.to_cli_str().to_string()),
+        ast_stats: manifest.ast_stats,
     })
 }
 
@@ -261,11 +344,14 @@ pub struct ValidateResult {
     pub policy_hash_matches: bool,
     /// Files where path validation fails (symlink escape, etc.)
     pub path_unsafe_files: Vec<String>,
+    /// Chunk strategy from manifest.
+    pub chunk_strategy: Option<String>,
 }
 
 /// Full validation of the persistent index against the filesystem.
 /// Checks policy hash — if it doesn't match the current policy,
 /// reports policy_hash_matches=false and valid=false.
+/// R8: Also checks chunk_strategy is recognized; refuses unknown strategies.
 pub fn validate_index(repo_root: &Path, policy: &Policy) -> Result<ValidateResult> {
     if !IndexManifest::exists(repo_root) {
         return Ok(ValidateResult {
@@ -274,6 +360,7 @@ pub fn validate_index(repo_root: &Path, policy: &Policy) -> Result<ValidateResul
             deleted_files: vec![],
             policy_hash_matches: false,
             path_unsafe_files: vec![],
+            chunk_strategy: None,
         });
     }
 
@@ -281,6 +368,10 @@ pub fn validate_index(repo_root: &Path, policy: &Policy) -> Result<ValidateResul
 
     let current_policy_hash = compute_policy_hash(policy);
     let policy_hash_matches = manifest.policy_hash == current_policy_hash;
+
+    // R8: chunk_strategy must be recognized
+    let strategy_ok = manifest.chunk_strategy == ChunkStrategy::LineWindowV1
+        || manifest.chunk_strategy == ChunkStrategy::AstV1;
 
     let mut stale_files = Vec::new();
     let mut deleted_files = Vec::new();
@@ -311,11 +402,15 @@ pub fn validate_index(repo_root: &Path, policy: &Policy) -> Result<ValidateResul
         }
     }
 
+    let schema_ok =
+        manifest.schema_version == SCHEMA_VERSION || manifest.schema_version == SCHEMA_VERSION_R7;
+
     let valid = policy_hash_matches
+        && strategy_ok
         && stale_files.is_empty()
         && deleted_files.is_empty()
         && path_unsafe_files.is_empty()
-        && manifest.schema_version == SCHEMA_VERSION;
+        && schema_ok;
 
     Ok(ValidateResult {
         valid,
@@ -323,6 +418,7 @@ pub fn validate_index(repo_root: &Path, policy: &Policy) -> Result<ValidateResul
         deleted_files,
         policy_hash_matches,
         path_unsafe_files,
+        chunk_strategy: Some(manifest.chunk_strategy.to_cli_str().to_string()),
     })
 }
 
@@ -335,7 +431,7 @@ pub struct PurgeResult {
     pub removed_paths: Vec<String>,
 }
 
-/// Safely delete R7 persistent index artifacts.
+/// Safely delete R7/R8 persistent index artifacts.
 ///
 /// Safety: Only deletes under .openlocus/index/ and does not follow symlinks
 /// that would escape the repo root.
@@ -361,7 +457,7 @@ pub fn purge_index(repo_root: &Path) -> Result<PurgeResult> {
         bail!("index directory escapes repo root — refusing to purge for safety");
     }
 
-    // Remove only known R7 artifact paths, not arbitrary files
+    // Remove only known R7/R8 artifact paths, not arbitrary files
     let mut removed = Vec::new();
 
     let tantivy_dir = repo_root.join(TANTIVY_DIR_RELATIVE);
@@ -424,6 +520,8 @@ pub struct PolicyMismatchError {
 ///
 /// Policy gate: if manifest policy_hash doesn't match current policy,
 /// returns an error — refuses to search a stale-policy index.
+/// Schema gate: refuses if schema_version doesn't match.
+/// Strategy gate (R8): refuses if chunk_strategy is unrecognized or missing.
 pub fn search_persistent_bm25(
     repo_root: &Path,
     query: &str,
@@ -445,9 +543,7 @@ pub fn search_persistent_bm25(
         ));
     }
 
-    // Manifest/policy gate: refuse to search if the persistent manifest is
-    // missing. The Tantivy directory alone is not enough to prove schema,
-    // policy, or freshness invariants.
+    // Manifest/policy/schema/strategy gate
     if !IndexManifest::exists(repo_root) {
         bail!("persistent index manifest missing; rebuild the index with 'openlocus index build'");
     }
@@ -462,11 +558,20 @@ pub fn search_persistent_bm25(
         );
     }
     // Schema gate
-    if manifest.schema_version != SCHEMA_VERSION {
+    if manifest.schema_version != SCHEMA_VERSION && manifest.schema_version != SCHEMA_VERSION_R7 {
         bail!(
             "persistent index schema version mismatch: manifest={}, current={}. Rebuild the index with 'openlocus index build'",
             manifest.schema_version,
             SCHEMA_VERSION
+        );
+    }
+    // Strategy gate (R8): chunk_strategy must be recognized
+    if manifest.chunk_strategy != ChunkStrategy::LineWindowV1
+        && manifest.chunk_strategy != ChunkStrategy::AstV1
+    {
+        bail!(
+            "persistent index chunk strategy unrecognized: {:?}. Rebuild the index with 'openlocus index build'",
+            manifest.chunk_strategy
         );
     }
 
@@ -676,16 +781,15 @@ pub struct PersistentBm25Index {
 
 impl PersistentBm25Index {
     /// Open the persistent BM25 index for reuse.
-    /// Validates policy hash and schema version.
-    /// Returns error if index doesn't exist or policy/schema mismatches.
+    /// Validates policy hash, schema version, and chunk strategy.
+    /// Returns error if index doesn't exist or policy/schema/strategy mismatches.
     pub fn open(repo_root: &Path, policy: &Policy) -> Result<Self> {
         let tantivy_dir = repo_root.join(TANTIVY_DIR_RELATIVE);
         if !tantivy_dir.exists() {
             bail!("persistent index does not exist; run 'openlocus index build' first");
         }
 
-        // Manifest/policy gate: the manifest is mandatory for persistent
-        // search because it binds the Tantivy artifact to policy/schema.
+        // Manifest/policy/schema/strategy gate
         if !IndexManifest::exists(repo_root) {
             bail!("persistent index manifest missing; rebuild the index");
         }
@@ -699,11 +803,20 @@ impl PersistentBm25Index {
                 current_policy_hash
             );
         }
-        if manifest.schema_version != SCHEMA_VERSION {
+        if manifest.schema_version != SCHEMA_VERSION && manifest.schema_version != SCHEMA_VERSION_R7
+        {
             bail!(
                 "persistent index schema version mismatch: manifest={}, current={}. Rebuild the index",
                 manifest.schema_version,
                 SCHEMA_VERSION
+            );
+        }
+        if manifest.chunk_strategy != ChunkStrategy::LineWindowV1
+            && manifest.chunk_strategy != ChunkStrategy::AstV1
+        {
+            bail!(
+                "persistent index chunk strategy unrecognized: {:?}. Rebuild the index",
+                manifest.chunk_strategy
             );
         }
 
@@ -1008,15 +1121,49 @@ mod tests {
             },
         ];
 
-        let result = build_index(root, &records, &policy).unwrap();
+        let result = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
         assert!(result.success);
         assert_eq!(result.file_count, 2);
         assert!(result.chunk_count > 0);
+        assert_eq!(result.chunk_strategy, "line");
 
         let (evidence, stats) = search_persistent_bm25(root, "authenticate", 10, &policy).unwrap();
         assert!(!evidence.is_empty(), "should find matches");
         assert_eq!(evidence[0].core.path, "app.rs");
         assert_eq!(evidence[0].core.channels[0], Channel::Bm25);
+        assert_eq!(stats.stale_hits_skipped, 0);
+    }
+
+    #[test]
+    fn build_ast_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(
+            root.join("app.rs"),
+            "fn authenticate_user() -> bool {\n    true\n}\n\nfn helper() -> i32 { 1 }\n",
+        )
+        .unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "app.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "app.rs"),
+            language: "rust".into(),
+        }];
+
+        let result = build_index(root, &records, &policy, ChunkStrategy::AstV1).unwrap();
+        assert!(result.success);
+        assert_eq!(result.chunk_strategy, "ast");
+        assert!(result.ast_stats.is_some());
+        let ast = result.ast_stats.unwrap();
+        assert_eq!(ast.supported_files, 1);
+        assert!(ast.ast_chunks > 0, "should have AST chunks");
+
+        // Search should work with AST-built index
+        let (evidence, stats) = search_persistent_bm25(root, "authenticate", 10, &policy).unwrap();
+        assert!(!evidence.is_empty(), "should find matches");
         assert_eq!(stats.stale_hits_skipped, 0);
     }
 
@@ -1035,7 +1182,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         // Modify the file after indexing
         std::fs::write(root.join("auth.rs"), "fn authorize() {}\nfn extra() {}\n").unwrap();
@@ -1062,7 +1209,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         // Delete the file after indexing
         std::fs::remove_file(root.join("temp.rs")).unwrap();
@@ -1090,7 +1237,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         // Change policy
         let mut different_policy = Policy::default();
@@ -1121,14 +1268,9 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
-        // Manually corrupt the Tantivy index: not easy to inject empty sha
-        // into a committed Tantivy segment. Instead, verify that the code
-        // path exists by checking the logic in search_persistent_bm25.
-        // This test is a behavioral smoke test.
         let (evidence, stats) = search_persistent_bm25(root, "hello", 10, &policy).unwrap();
-        // With valid data, should find results and no invalid skips
         if !evidence.is_empty() {
             assert_eq!(stats.invalid_hits_skipped, 0);
         }
@@ -1136,22 +1278,14 @@ mod tests {
 
     #[test]
     fn strict_range_validation_no_clamp() {
-        // This test verifies that if chunk range is invalid for current file,
-        // it's skipped rather than clamped. We can't easily inject bad ranges
-        // into Tantivy, so we test the validation logic directly.
         let lines = vec!["line1", "line2", "line3"];
         let query_tokens = vec!["line".to_string()];
 
-        // Valid range
         let result = find_best_matching_line(&lines, 1, 3, &query_tokens);
         assert!(result.is_some());
 
-        // start > end → the loop won't execute, returns None
         let result = find_best_matching_line(&lines, 3, 1, &query_tokens);
         assert!(result.is_none());
-
-        // start = 0 → would underflow if used directly
-        // The search function checks chunk_start_line < 1 → skip
     }
 
     #[test]
@@ -1169,13 +1303,38 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let status = status_index(root, &policy).unwrap();
         assert!(status.exists);
         assert_eq!(status.schema_version.as_deref(), Some(SCHEMA_VERSION));
         assert_eq!(status.file_count, Some(1));
         assert_eq!(status.policy_hash_matches, Some(true));
+        assert!(!status.requires_rebuild);
+        assert_eq!(status.chunk_strategy.as_deref(), Some("line"));
+    }
+
+    #[test]
+    fn status_after_ast_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("test.rs"), "fn test() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "test.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "test.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::AstV1).unwrap();
+
+        let status = status_index(root, &policy).unwrap();
+        assert!(status.exists);
+        assert_eq!(status.chunk_strategy.as_deref(), Some("ast"));
+        assert!(status.ast_stats.is_some());
         assert!(!status.requires_rebuild);
     }
 
@@ -1194,9 +1353,8 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
-        // Modify file
         std::fs::write(root.join("app.rs"), "fn new() {}\nfn extra() {}\n").unwrap();
 
         let status = status_index(root, &policy).unwrap();
@@ -1219,12 +1377,13 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let validate = validate_index(root, &policy).unwrap();
         assert!(validate.valid);
         assert!(validate.stale_files.is_empty());
         assert!(validate.deleted_files.is_empty());
+        assert_eq!(validate.chunk_strategy.as_deref(), Some("line"));
     }
 
     #[test]
@@ -1242,9 +1401,8 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
-        // Modify file
         std::fs::write(root.join("s.rs"), "fn updated() {}\n").unwrap();
 
         let validate = validate_index(root, &policy).unwrap();
@@ -1267,7 +1425,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
         std::fs::remove_file(root.join("d.rs")).unwrap();
 
         let validate = validate_index(root, &policy).unwrap();
@@ -1290,7 +1448,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let mut different_policy = Policy::default();
         different_policy.remote.allow = true;
@@ -1315,7 +1473,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         assert!(root.join(TANTIVY_DIR_RELATIVE).exists());
         assert!(root.join(MANIFEST_PATH_RELATIVE).exists());
@@ -1350,7 +1508,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let (evidence, _stats) = search_persistent_bm25(root, "banana", 10, &policy).unwrap();
         assert!(evidence.is_empty(), "no token overlap should skip");
@@ -1375,7 +1533,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let (evidence, _stats) =
             search_persistent_bm25(root, "authentication", 10, &policy).unwrap();
@@ -1405,7 +1563,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let (evidence, _stats) = search_persistent_bm25(root, "hello", 10, &policy).unwrap();
         if let Some(ev) = evidence.first() {
@@ -1422,7 +1580,7 @@ mod tests {
         let root = dir.path();
 
         let policy = Policy::default();
-        let result = build_index(root, &[], &policy).unwrap();
+        let result = build_index(root, &[], &policy, ChunkStrategy::LineWindowV1).unwrap();
         assert!(result.success);
         assert_eq!(result.file_count, 0);
         assert_eq!(result.chunk_count, 0);
@@ -1464,7 +1622,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let handle = PersistentBm25Index::open(root, &policy).unwrap();
         let (evidence, stats) = handle.search(root, "authenticate", 10).unwrap();
@@ -1487,7 +1645,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
 
         let mut different_policy = Policy::default();
         different_policy.remote.allow = true;
@@ -1514,7 +1672,7 @@ mod tests {
             language: "rust".into(),
         }];
 
-        let _ = build_index(root, &records, &policy).unwrap();
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
         std::fs::remove_file(root.join(MANIFEST_PATH_RELATIVE)).unwrap();
 
         let search_result = search_persistent_bm25(root, "authenticate", 10, &policy);

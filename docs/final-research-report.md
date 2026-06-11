@@ -1,14 +1,14 @@
-# OpenLocus R0-R7 Research Report
+# OpenLocus R0-R8 Research Report
 
 Date: 2026-06-11  
 Repository: `https://github.com/Youzini-afk/OpenLocus.git`  
-Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R7 persistent local index milestone.
+Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R8 AST chunking and symbol extraction milestone.
 
 ## Executive summary
 
 OpenLocus now has a working Rust prototype that validates the core design direction: **all agent-facing code facts must be evidence-backed, citation-checkable, and freshness-aware**.
 
-The implementation completed seven evidence-gated milestones:
+The implementation completed eight evidence-gated milestones:
 
 | Commit | Stage | Result |
 |---|---|---|
@@ -18,18 +18,19 @@ The implementation completed seven evidence-gated milestones:
 | `925ed38` | R4 derived indexing safety | `DerivedIndexView`, deterministic rule generator, policy/freshness gates, JSONL store. |
 | `83ae02e` | R5 graph scaffold | Deterministic depth=1 graph, StoreHit materialization, impact/test-selection smoke. |
 | `fb7104e` | R6 fast context prototype | 4-turn deterministic context orchestration with EvidencePack-compatible output. |
-| R7 checkpoint | R7 persistent BM25 index | Persistent Tantivy index with mandatory manifest/policy gates, safe hit validation, and warm benchmark. |
+| `43135ed` | R7 persistent BM25 index | Persistent Tantivy index with mandatory manifest/policy gates, safe hit validation, and warm benchmark. |
+| R8 checkpoint | R8 AST chunking/symbols | Tree-sitter AST-bounded chunking and AST symbol search as explicit experimental modes. |
 
 Final verification snapshot:
 
 ```text
-Rust tests: 153 passed
+Rust tests: 176 passed
 fmt: clean
 clippy: clean with -D warnings
 Remote dependency: none
 LLM dependency: none
 TDB dependency: none (placeholder only)
-Safety evals: storage, derived, graph, fast-context, persistent-index all passing their Level0 gates
+Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates
 ```
 
 The most important research outcome is not that retrieval quality is solved. It is that the project now has a **safe experimental harness** where BM25, graph, TDB, LLM-derived views, dense embeddings, and future planners can be tested without weakening the EvidenceCore contract.
@@ -61,13 +62,14 @@ Current workspace structure:
 crates/openlocus-core       EvidenceCore, EvidenceMeta, EvidencePack, Policy, trace types
 crates/openlocus-repo       path safety, read, scan, content hashing
 crates/openlocus-retrieval  regex/text search, BM25, symbol search, RRF fusion
+crates/openlocus-ast        Tree-sitter AST chunk and symbol extraction scaffold
 crates/openlocus-index      persistent Tantivy BM25 index, manifest, warm benchmark handle
 crates/openlocus-store      Store traits, StoreHit materialization, conservative store, TDB placeholder
 crates/openlocus-derived    DerivedIndexView safety scaffold
 crates/openlocus-graph      deterministic graph scaffold + graph materialization
 crates/openlocus-context    Fast Context Level0 rule loop
 crates/openlocus-cli        user-facing CLI
-eval/                       retrieval/storage/derived/graph/fast-context/persistent-index smoke and scoring scripts
+eval/                       retrieval/storage/derived/graph/fast-context/persistent-index/AST smoke and scoring scripts
 docs/                       research log, summary, agent guide, final report
 ```
 
@@ -79,7 +81,7 @@ openlocus scan --json
 openlocus search regex <pattern> --json
 openlocus search bm25 <query> --json
 openlocus search bm25 <query> --index persistent --json
-openlocus search symbol <name> --json
+openlocus search symbol <name> --mode regex|ast|auto --json
 openlocus retrieve <query> --channels regex,bm25,symbol --json
 openlocus citations validate <file.json> --json
 openlocus store status conservative --json
@@ -88,7 +90,7 @@ openlocus graph build --json
 openlocus impact <path> --json
 openlocus tests --path <path> --json
 openlocus fast-context <query> --json
-openlocus index build --json
+openlocus index build --chunk-strategy line|ast --json
 openlocus index status --json
 openlocus index validate --json
 openlocus index purge --json
@@ -285,17 +287,42 @@ persistent_index_smoke: 32/32 checks passed
 
 Status: passed Level0 smoke and oracle safety gates. This is a small self-referential benchmark, not a general performance claim.
 
+### R8 — AST-bounded chunking and AST symbol extraction
+
+Goal: test whether Tree-sitter chunk boundaries can improve future span precision without changing EvidenceCore or weakening R7 persistent-index safety.
+
+Implemented:
+
+- `openlocus-ast` crate using Tree-sitter 0.25.x grammars for Rust, Python, JavaScript, and TypeScript.
+- `extract_ast_chunks(path, language, source, max_lines)` returns AST-bounded chunks plus fallback line windows; unsupported languages and parse errors fall back to line windows.
+- `extract_ast_symbols(path, language, source)` returns narrow header/signature spans; parse errors and unsupported languages return empty AST symbols so callers can use regex fallback.
+- Persistent index manifest schema advanced to `r8-bm25-v2`, with `chunk_strategy` and optional `ast_stats`.
+- `openlocus index build --chunk-strategy line|ast --json`; line remains default, AST is explicit/experimental.
+- `openlocus search symbol <name> --mode regex|ast|auto --json`; regex mode preserves old behavior, auto tries AST then regex fallback.
+- `eval/ast_chunking_smoke.py` with 40 Level0 safety checks.
+
+Critical gates:
+
+- AST chunks/symbols are candidates only; final Evidence still comes from current file hash/range/excerpt/freshness validation.
+- AST symbol output is narrow header/signature evidence, not full function bodies by default.
+- Parser-error files fall back instead of producing AST-bounded evidence from error trees.
+- Policy-excluded files are not parsed/indexed/searched.
+- Default line-window build/search remains available and R7 persistent smoke still passes.
+
+Status: passed Level0 smoke (`40/40`) and full Rust tests (`176`). AST quality lift is **not proven** yet; this is an experimental scaffold.
+
 ## Cross-stage findings
 
 ### 1. EvidenceCore stayed stable
 
-R0-R7 did not require changing the core evidence contract. Research features were added around it:
+R0-R8 did not require changing the core evidence contract. Research features were added around it:
 
 - storage uses StoreHit candidates;
 - derived indexing uses DerivedIndexView;
 - graph uses GraphEdge candidates and materialization;
 - fast-context outputs EvidencePack-compatible wrappers.
 - persistent BM25 uses Tantivy hits plus mandatory manifest/policy gates, then materializes from the current filesystem before output.
+- AST chunking/symbol extraction only changes candidate boundaries; it still materializes final Evidence from current filesystem validation.
 
 This validates the original “small and hard” contract design.
 
@@ -359,7 +386,8 @@ This prototype is intentionally not production-ready.
 - ConservativeChunkStore is in-memory and ephemeral.
 - TDB is a placeholder only; no real TriviumDB code is linked.
 - LLM indexing is a deterministic safety scaffold only; no real model/provider is used.
-- Graph parsing is heuristic and line-based; no LSP/SCIP/Tree-sitter graph yet.
+- AST chunking/symbol extraction is experimental; no quality lift has been proven yet.
+- Graph parsing is heuristic and line-based; no LSP/SCIP graph yet.
 - Config graph edges are noisy.
 - Fast Context is fixed-rule orchestration, not adaptive planning.
 - Token budget uses chars/4 approximation, not a tokenizer.
@@ -368,26 +396,15 @@ This prototype is intentionally not production-ready.
 
 ## Recommended next research stages
 
-### R8 — Tree-sitter chunking and symbol extraction
+### R9 — AST quality bakeoff and persistent index incrementality
 
 Priority: high.
 
-Replace line chunks with AST-bounded function/class/test/config chunks for Rust, Python, TS/JS initially.
+Compare AST vs line chunk strategies on retrieval quality, then extend persistent indexes from full rebuild to incremental updates and run warm/cold SLO measurements on larger repositories.
 
 Gate:
 
-- improved SpanF0.5 / token waste on the fixture;
-- no decrease in citation validity;
-- chunk boundaries explainable.
-
-### R9 — persistent index incrementality and larger-repo SLO
-
-Priority: high.
-
-Extend R7 from full rebuild to incremental updates and run warm/cold SLO measurements on larger repositories.
-
-Gate:
-
+- AST mode improves SpanF0.5/token waste or remains experimental only;
 - dirty overlay/update p95 near P0 target;
 - no stale verified evidence after edit/delete/rename;
 - branch switch does not mix stale manifests;

@@ -493,3 +493,87 @@ Note: These are implementation notes and initial SLO measurements on a small sel
 - The index is stored under `.openlocus/index/` which may grow large for big repos. No size limit or rotation is implemented.
 - Tantivy index is not encrypted; content is stored in the Tantivy segment files under `.openlocus/index/tantivy/`.
 - R7 Level0 passed only after oracle review gates (policy hash, validate_path, empty sha, strict range, honest warm benchmark).
+
+## 2026-06-11 — R8 AST-bounded chunking + AST symbol extraction (experimental)
+
+### Objective
+
+Add Tree-sitter-based AST chunking and symbol extraction as an experimental, opt-in alternative to line-window chunking. AST mode changes candidate chunk/symbol boundaries; final Evidence still requires current-filesystem path/range/hash/excerpt/freshness verification. Line-window chunking remains the default.
+
+### Current hypothesis
+
+AST-bounded chunks should improve retrieval precision by aligning chunk boundaries with logical code structures (functions, classes, structs, etc.) rather than arbitrary line windows. However, the quality lift is not yet proven by eval; this is an experimental scaffold.
+
+### Stage gates
+
+- R8 passes when AST build/search/validate/status work correctly, AST symbol search returns tree_sitter-channel Evidence, stale mutation is detected, fallback (unsupported language, parse error) is correct, and R7 persistent smoke still passes.
+- AST mode is opt-in (`--chunk-strategy ast`); line remains default.
+- No quality claim unless eval computes it.
+
+### Implementation notes
+
+- New crate `openlocus-ast` with Tree-sitter 0.25.x + language grammars (Rust, Python, JavaScript, TypeScript).
+- `extract_ast_chunks(path, language, source, max_lines)`: Parses source with Tree-sitter for supported languages, extracts definition nodes (fn/struct/enum/trait/impl/mod/type/macro for Rust; function_definition/class_definition/decorated_definition for Python; function/class/method/lexical/variable/export for JS/TS plus interface/type/enum for TS). Oversized nodes split into line windows. Gaps covered by fallback line windows. No overlapping chunks. Strict 1-based line ranges. Unsupported language or parse error → fallback line windows.
+- `extract_ast_symbols(path, language, source)`: Extracts narrow header/signature spans (max 10 lines, usually signature/header only rather than full bodies) for definitions. Uses Tree-sitter node field "name" for symbol extraction, with special handling for decorated Python definitions. Unsupported/parse error → empty symbols + fallback status; callers use regex fallback.
+- Manifest schema version changed to `r8-bm25-v2`. R7 manifests (`r7-bm25-v1`) still loadable with default chunk_strategy=line_window_v1. Unrecognized schema versions refuse with rebuild instruction.
+- `ChunkStrategy` enum: `LineWindowV1` (default), `AstV1` (experimental). Stored in manifest.
+- `AstManifestStats` in manifest: supported_files, fallback_files, parser_error_files, ast_chunks, fallback_chunks.
+- CLI: `openlocus index build --chunk-strategy line|ast` (default line). `openlocus search symbol <name> --mode regex|ast|auto` (default auto: AST first for supported files, regex fallback).
+- Search/validate/status refuse if manifest chunk_strategy is unrecognized. R7 manifests without chunk_strategy are loaded as line_window_v1 for compatibility; R8-written manifests always include chunk_strategy. No silent search of unverifiable strategy.
+- AST symbol Evidence uses Channel::TreeSitter, narrow span, current-file hash/excerpt/freshness validation. Regex symbol Evidence uses Channel::Regex (unchanged).
+- `eval/ast_chunking_smoke.py`: 40 safety checks covering AST build/status/validate/search, parser-error visibility, stale mutation, narrow AST symbol header, symbol search modes, citation validation, schema mismatch, policy exclusion, default line build compatibility.
+
+### R8 AST chunking safety checks
+
+| Check | Result |
+|---|---|
+| Line build succeeds (default strategy) | ✅ |
+| Line build has chunk_strategy=line | ✅ |
+| Line build has no ast_stats | ✅ |
+| AST build succeeds | ✅ |
+| AST build has chunk_strategy=ast | ✅ |
+| AST build has ast_stats | ✅ |
+| AST stats: supported_files > 0 | ✅ |
+| AST stats: ast_chunks > 0 | ✅ |
+| AST stats: parser_error_files visible | ✅ |
+| AST status: chunk_strategy=ast | ✅ |
+| AST status: has ast_stats | ✅ |
+| AST status: no rebuild needed | ✅ |
+| AST validate: valid | ✅ |
+| AST validate: chunk_strategy=ast | ✅ |
+| AST search persistent: returns evidence | ✅ |
+| AST search: all freshness verified_current | ✅ |
+| Stale mutation: no verified_current evidence for stale file | ✅ |
+| Stale mutation: stale_hits_skipped > 0 | ✅ |
+| Validate detects stale after mutation | ✅ |
+| AST symbol search: returns results | ✅ |
+| AST symbol: uses tree_sitter channel | ✅ |
+| AST symbol: header/signature span, not full body | ✅ |
+| Regex symbol search: returns results | ✅ |
+| Auto symbol search: returns results | ✅ |
+| Policy excluded files absent | ✅ |
+| Citation validation: valid | ✅ |
+| Citation validation: invalid_count=0 | ✅ |
+| Bad schema version: search refuses | ✅ |
+| Line build after AST: succeeds | ✅ |
+| Line build after AST: strategy=line | ✅ |
+
+### Key findings
+
+1. **AST chunking is functional as an experimental scaffold**: Tree-sitter parsing works for Rust, Python, JavaScript, and TypeScript. Chunk boundaries align with logical code structures.
+2. **Fallback is correct**: Unsupported languages fall back to line-window chunking. Parse errors also fall back. No data loss.
+3. **Oversized node splitting works**: Functions exceeding max_lines are split into line windows with kind=fallback_line_window.
+4. **Gap filling ensures complete coverage**: No gaps or overlaps between chunks.
+5. **AST symbol extraction produces narrow, citation-valid Evidence**: Symbols use Channel::TreeSitter, narrow header/signature spans (max 10 lines, usually signature/header only rather than full bodies), and are verified against the current filesystem.
+6. **R7 persistent smoke still passes**: Default line build continues to work. Schema version is backward-compatible (R7 manifests loadable).
+7. **Quality lift is NOT proven**: This is an experimental scaffold. No comparative eval has been run to measure retrieval quality improvement from AST chunking vs line-window chunking.
+
+### Caveats
+
+- AST mode is experimental and opt-in. Line-window chunking remains the default and recommended strategy.
+- Tree-sitter parsers may have edge cases or version-specific behavior. The quality of chunking depends on the grammar quality.
+- AST symbol extraction does not handle all possible symbol patterns (e.g., re-exports, aliased imports, nested definitions). Regex fallback covers many of these.
+- The `auto` mode for symbol search tries AST first for supported files and falls back to regex if no results. This may miss cases where regex finds results that AST does not.
+- No incremental update for AST index; `build_index` is always a full rebuild.
+- Manifest schema version `r8-bm25-v2` is not compatible with `r7-bm25-v1` for search purposes (older schemas load but may require rebuild for search).
+- AST chunking adds Tree-sitter as a dependency, increasing binary size and compile time.

@@ -1,5 +1,5 @@
 [package]
-name = "openlocus-index"
+name = "openlocus-ast"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,14 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake3.workspace = true
-openlocus-ast = { path = "../openlocus-ast" }
-openlocus-core = { path = "../openlocus-core" }
-openlocus-repo = { path = "../openlocus-repo" }
 serde.workspace = true
 serde_json.workspace = true
-tantivy.workspace = true
-toml.workspace = true
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
 
 [dev-dependencies]
 tempfile.workspace = true
