@@ -333,6 +333,696 @@ pub fn status_index(repo_root: &Path, policy: &Policy) -> Result<StatusResult> {
     })
 }
 
+// ── Dirty ──────────────────────────────────────────────────────────────
+
+/// Dirty summary: manifest-vs-current scan result.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DirtyResult {
+    /// True if index is fully clean (no added/modified/deleted, policy/schema match).
+    pub clean: bool,
+    /// True if any file-level update is needed (added/modified/deleted).
+    pub requires_update: bool,
+    /// True if full rebuild is required (policy/schema/strategy mismatch, or no index).
+    pub requires_rebuild: bool,
+    /// Policy-included files on disk but not in manifest.
+    pub added_files: Vec<String>,
+    /// Manifest entries whose current content_sha differs.
+    pub modified_files: Vec<String>,
+    /// Manifest entries whose files no longer exist on disk.
+    pub deleted_files: Vec<String>,
+    pub added_count: u64,
+    pub modified_count: u64,
+    pub deleted_count: u64,
+    pub policy_hash_matches: bool,
+    pub schema_matches: bool,
+    pub chunk_strategy: Option<String>,
+}
+
+/// Compute a dirty summary comparing manifest entries against the current
+/// filesystem scan. Also discovers policy-included files not in the manifest.
+///
+/// Requires an existing index + manifest; otherwise returns requires_rebuild=true.
+/// Policy-excluded added files are NOT reported as requiring update.
+pub fn dirty_index(
+    repo_root: &Path,
+    policy: &Policy,
+    current_records: &[FileRecord],
+) -> Result<DirtyResult> {
+    if !IndexManifest::exists(repo_root) {
+        return Ok(DirtyResult {
+            clean: false,
+            requires_update: false,
+            requires_rebuild: true,
+            added_files: vec![],
+            modified_files: vec![],
+            deleted_files: vec![],
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            policy_hash_matches: false,
+            schema_matches: false,
+            chunk_strategy: None,
+        });
+    }
+
+    let manifest = match IndexManifest::load(repo_root) {
+        Ok(m) => m,
+        Err(_) => {
+            // Manifest exists but is corrupt/unloadable → requires rebuild
+            return Ok(DirtyResult {
+                clean: false,
+                requires_update: false,
+                requires_rebuild: true,
+                added_files: vec![],
+                modified_files: vec![],
+                deleted_files: vec![],
+                added_count: 0,
+                modified_count: 0,
+                deleted_count: 0,
+                policy_hash_matches: false,
+                schema_matches: false,
+                chunk_strategy: None,
+            });
+        }
+    };
+    let current_policy_hash = compute_policy_hash(policy);
+    let policy_hash_matches = manifest.policy_hash == current_policy_hash;
+
+    let schema_ok =
+        manifest.schema_version == SCHEMA_VERSION || manifest.schema_version == SCHEMA_VERSION_R7;
+    let strategy_ok = manifest.chunk_strategy == ChunkStrategy::LineWindowV1
+        || manifest.chunk_strategy == ChunkStrategy::AstV1;
+
+    // Build a set of ALL manifest paths (indexed + skipped) for added detection.
+    // This prevents skipped entries from being falsely reported as "added".
+    let manifest_all_paths: std::collections::HashSet<String> =
+        manifest.files.iter().map(|f| f.path.clone()).collect();
+
+    let mut modified_files = Vec::new();
+    let mut deleted_files = Vec::new();
+
+    for entry in &manifest.files {
+        let full_path = repo_root.join(&entry.path);
+        if !full_path.exists() {
+            // File deleted from disk: always report as deleted regardless of status
+            deleted_files.push(entry.path.clone());
+            continue;
+        }
+        if entry.status == "indexed" {
+            // Check if content changed
+            if let Ok(bytes) = std::fs::read(&full_path) {
+                let current_sha = blake3::hash(&bytes).to_hex().to_string();
+                if current_sha != entry.content_sha {
+                    modified_files.push(entry.path.clone());
+                }
+            }
+        } else {
+            // Skipped entry: check if file has changed and could now be indexed
+            if let Ok(bytes) = std::fs::read(&full_path) {
+                let current_sha = blake3::hash(&bytes).to_hex().to_string();
+                if current_sha != entry.content_sha {
+                    // Content changed: report as modified (update may promote to indexed)
+                    modified_files.push(entry.path.clone());
+                }
+                // If sha unchanged, skipped entry is still clean; do not report as added/modified
+            }
+        }
+    }
+
+    // Added: policy-included files in current_records not in ANY manifest path
+    let mut added_files = Vec::new();
+    for record in current_records {
+        if !manifest_all_paths.contains(&record.path) {
+            added_files.push(record.path.clone());
+        }
+    }
+
+    let requires_rebuild = !schema_ok || !policy_hash_matches || !strategy_ok;
+    let requires_update = !requires_rebuild
+        && (!added_files.is_empty() || !modified_files.is_empty() || !deleted_files.is_empty());
+    let clean = !requires_rebuild && !requires_update;
+
+    Ok(DirtyResult {
+        clean,
+        requires_update,
+        requires_rebuild,
+        added_files: added_files.clone(),
+        modified_files: modified_files.clone(),
+        deleted_files: deleted_files.clone(),
+        added_count: added_files.len() as u64,
+        modified_count: modified_files.len() as u64,
+        deleted_count: deleted_files.len() as u64,
+        policy_hash_matches,
+        schema_matches: schema_ok,
+        chunk_strategy: Some(manifest.chunk_strategy.to_cli_str().to_string()),
+    })
+}
+
+// ── Update ────────────────────────────────────────────────────────────
+
+/// Result of an incremental index update.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UpdateResult {
+    pub success: bool,
+    pub added_count: u64,
+    pub modified_count: u64,
+    pub deleted_count: u64,
+    pub commit_ms: u64,
+    pub manifest_written: bool,
+    pub post_status_clean: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Incremental update of the persistent index.
+///
+/// Modes:
+/// - `dirty=true`: compute added/modified/deleted from dirty summary, then apply batch.
+/// - `path=Some(p)`: update only that single policy-included path.
+///
+/// Safety gates:
+/// - If index/manifest missing → error (requires rebuild).
+/// - If policy hash/schema/strategy mismatch → refuse update (requires rebuild).
+/// - Chunk according to manifest chunk_strategy (do not mix strategies).
+/// - Delete old Tantivy docs by path before adding new ones (prevent duplicates).
+/// - Commit once after batch.
+/// - Write manifest atomically (tmp + rename).
+/// - Tantivy deletes are tombstones until merge; this is documented, not a bug.
+pub fn update_index(
+    repo_root: &Path,
+    policy: &Policy,
+    current_records: &[FileRecord],
+    dirty: bool,
+    path: Option<&str>,
+) -> Result<UpdateResult> {
+    let start = Instant::now();
+
+    // Gate: manifest must exist
+    if !IndexManifest::exists(repo_root) {
+        return Ok(UpdateResult {
+            success: false,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            commit_ms: 0,
+            manifest_written: false,
+            post_status_clean: false,
+            error: Some(
+                "index manifest missing; rebuild the index with 'openlocus index build'".into(),
+            ),
+        });
+    }
+
+    let manifest = match IndexManifest::load(repo_root) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(UpdateResult {
+                success: false,
+                added_count: 0,
+                modified_count: 0,
+                deleted_count: 0,
+                commit_ms: 0,
+                manifest_written: false,
+                post_status_clean: false,
+                error: Some(format!(
+                    "manifest load failed: {}. Rebuild the index with 'openlocus index build'",
+                    e
+                )),
+            });
+        }
+    };
+
+    // Gate: policy hash must match
+    let current_policy_hash = compute_policy_hash(policy);
+    if manifest.policy_hash != current_policy_hash {
+        return Ok(UpdateResult {
+            success: false,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            commit_ms: 0,
+            manifest_written: false,
+            post_status_clean: false,
+            error: Some(format!(
+                "policy hash mismatch: manifest={}, current={}. Rebuild the index with 'openlocus index build'",
+                manifest.policy_hash, current_policy_hash
+            )),
+        });
+    }
+
+    // Gate: schema must be recognized
+    if manifest.schema_version != SCHEMA_VERSION && manifest.schema_version != SCHEMA_VERSION_R7 {
+        return Ok(UpdateResult {
+            success: false,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            commit_ms: 0,
+            manifest_written: false,
+            post_status_clean: false,
+            error: Some(format!(
+                "schema version mismatch: manifest={}. Rebuild the index with 'openlocus index build'",
+                manifest.schema_version
+            )),
+        });
+    }
+
+    // Gate: chunk_strategy must be recognized
+    if manifest.chunk_strategy != ChunkStrategy::LineWindowV1
+        && manifest.chunk_strategy != ChunkStrategy::AstV1
+    {
+        return Ok(UpdateResult {
+            success: false,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            commit_ms: 0,
+            manifest_written: false,
+            post_status_clean: false,
+            error: Some(format!(
+                "unrecognized chunk strategy: {:?}. Rebuild the index with 'openlocus index build'",
+                manifest.chunk_strategy
+            )),
+        });
+    }
+
+    let tantivy_dir = repo_root.join(TANTIVY_DIR_RELATIVE);
+    if !tantivy_dir.exists() {
+        return Ok(UpdateResult {
+            success: false,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            commit_ms: 0,
+            manifest_written: false,
+            post_status_clean: false,
+            error: Some(
+                "tantivy index directory missing; rebuild the index with 'openlocus index build'"
+                    .into(),
+            ),
+        });
+    }
+
+    let index = Index::open_in_dir(&tantivy_dir)?;
+    let schema = index.schema();
+    let path_field = schema.get_field("path")?;
+    let language_field = schema.get_field("language")?;
+    let content_sha_field = schema.get_field("content_sha")?;
+    let start_line_field = schema.get_field("start_line")?;
+    let end_line_field = schema.get_field("end_line")?;
+    let content_field = schema.get_field("content")?;
+
+    let mut index_writer = index.writer(50_000_000)?;
+
+    // Determine which paths to add/update/delete
+    let (paths_to_add, paths_to_modify, paths_to_delete) = if dirty {
+        let dirty_result = dirty_index(repo_root, policy, current_records)?;
+        if dirty_result.requires_rebuild {
+            return Ok(UpdateResult {
+                success: false,
+                added_count: 0,
+                modified_count: 0,
+                deleted_count: 0,
+                commit_ms: start.elapsed().as_millis() as u64,
+                manifest_written: false,
+                post_status_clean: false,
+                error: Some("requires rebuild due to policy/schema/strategy mismatch".into()),
+            });
+        }
+        (
+            dirty_result.added_files,
+            dirty_result.modified_files,
+            dirty_result.deleted_files,
+        )
+    } else if let Some(p) = path {
+        // Single-path update mode
+        let manifest_all_paths: std::collections::HashSet<String> =
+            manifest.files.iter().map(|f| f.path.clone()).collect();
+
+        let full_path = repo_root.join(p);
+        let record_map: std::collections::HashMap<String, &FileRecord> = current_records
+            .iter()
+            .map(|r| (r.path.clone(), r))
+            .collect();
+
+        if full_path.exists() {
+            // File exists: check if it's policy-included
+            let is_included = record_map.contains_key(p);
+            if is_included {
+                if manifest_all_paths.contains(p) {
+                    // Path is in manifest (indexed or skipped): check if modified
+                    if let Some(entry) = manifest.files.iter().find(|f| f.path == p)
+                        && let Ok(bytes) = std::fs::read(&full_path)
+                    {
+                        let current_sha = blake3::hash(&bytes).to_hex().to_string();
+                        if current_sha == entry.content_sha {
+                            // Unchanged — no-op but still succeed
+                            return Ok(UpdateResult {
+                                success: true,
+                                added_count: 0,
+                                modified_count: 0,
+                                deleted_count: 0,
+                                commit_ms: start.elapsed().as_millis() as u64,
+                                manifest_written: false,
+                                post_status_clean: true,
+                                error: None,
+                            });
+                        }
+                    }
+                    (vec![], vec![p.to_string()], vec![])
+                } else {
+                    (vec![p.to_string()], vec![], vec![])
+                }
+            } else {
+                return Ok(UpdateResult {
+                    success: false,
+                    added_count: 0,
+                    modified_count: 0,
+                    deleted_count: 0,
+                    commit_ms: start.elapsed().as_millis() as u64,
+                    manifest_written: false,
+                    post_status_clean: false,
+                    error: Some(format!("path '{}' is not policy-included", p)),
+                });
+            }
+        } else {
+            // File doesn't exist: if in manifest (indexed or skipped), delete it
+            if manifest_all_paths.contains(p) {
+                (vec![], vec![], vec![p.to_string()])
+            } else {
+                return Ok(UpdateResult {
+                    success: false,
+                    added_count: 0,
+                    modified_count: 0,
+                    deleted_count: 0,
+                    commit_ms: start.elapsed().as_millis() as u64,
+                    manifest_written: false,
+                    post_status_clean: false,
+                    error: Some(format!("path '{}' not in manifest and not on disk", p)),
+                });
+            }
+        }
+    } else {
+        return Ok(UpdateResult {
+            success: false,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            commit_ms: 0,
+            manifest_written: false,
+            post_status_clean: false,
+            error: Some("either --dirty or --path <path> must be specified".into()),
+        });
+    };
+
+    let chunk_strategy = manifest.chunk_strategy.clone();
+    let mut total_added: u64 = 0;
+    let mut total_modified: u64 = 0;
+    let mut total_deleted: u64 = 0;
+    let mut new_manifest_files = manifest.files.clone();
+    let mut total_new_chunks: u64 = 0;
+
+    // Build a record map for quick lookup
+    let record_map: std::collections::HashMap<String, &FileRecord> = current_records
+        .iter()
+        .map(|r| (r.path.clone(), r))
+        .collect();
+
+    // Process deletions: delete Tantivy docs, remove from manifest
+    for del_path in &paths_to_delete {
+        // Delete all Tantivy docs with this path
+        let delete_term = tantivy::Term::from_field_text(path_field, del_path);
+        index_writer.delete_term(delete_term);
+        total_deleted += 1;
+
+        // Remove from manifest files
+        new_manifest_files.retain(|f| f.path != *del_path);
+    }
+
+    // Process modifications: delete old docs, add new docs, update manifest
+    for mod_path in &paths_to_modify {
+        // Delete old docs first
+        let delete_term = tantivy::Term::from_field_text(path_field, mod_path);
+        index_writer.delete_term(delete_term);
+
+        // Add new docs
+        if let Some(record) = record_map.get(mod_path) {
+            if validate_path(repo_root, &record.path).is_err() {
+                // Mark as skipped in manifest
+                if let Some(entry) = new_manifest_files.iter_mut().find(|f| f.path == *mod_path) {
+                    entry.status = "skipped".into();
+                    entry.skipped_reason = Some("path_unsafe".into());
+                }
+                continue;
+            }
+
+            let full_path = repo_root.join(&record.path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    if let Some(entry) = new_manifest_files.iter_mut().find(|f| f.path == *mod_path)
+                    {
+                        entry.status = "skipped".into();
+                        entry.skipped_reason = Some("read_error".into());
+                    }
+                    continue;
+                }
+            };
+
+            let current_sha = blake3::hash(content.as_bytes()).to_hex().to_string();
+            let lines: Vec<&str> = content.lines().collect();
+            let total_lines = lines.len() as u64;
+
+            if total_lines == 0 {
+                if let Some(entry) = new_manifest_files.iter_mut().find(|f| f.path == *mod_path) {
+                    entry.status = "skipped".into();
+                    entry.skipped_reason = Some("empty_file".into());
+                    entry.content_sha = current_sha;
+                }
+                continue;
+            }
+
+            let chunks = compute_chunks(
+                &record.path,
+                &record.language,
+                &content,
+                total_lines,
+                &chunk_strategy,
+                &mut AstManifestStats::default(),
+            );
+
+            for (start_line, end_line) in &chunks {
+                let start_idx = (*start_line - 1) as usize;
+                let end_idx = *end_line as usize;
+                let chunk_content = if start_idx < lines.len() && end_idx <= lines.len() {
+                    lines[start_idx..end_idx].join("\n")
+                } else {
+                    continue;
+                };
+
+                index_writer.add_document(doc!(
+                    path_field => record.path.as_str(),
+                    language_field => record.language.as_str(),
+                    content_sha_field => current_sha.as_str(),
+                    start_line_field => *start_line,
+                    end_line_field => *end_line,
+                    content_field => chunk_content.as_str(),
+                ))?;
+
+                total_new_chunks += 1;
+            }
+
+            // Update manifest entry
+            if let Some(entry) = new_manifest_files.iter_mut().find(|f| f.path == *mod_path) {
+                entry.content_sha = current_sha.clone();
+                entry.size_bytes = record.size;
+                entry.status = "indexed".into();
+                entry.skipped_reason = None;
+            }
+
+            total_modified += 1;
+        }
+    }
+
+    // Process additions: add new docs, add manifest entries
+    for add_path in &paths_to_add {
+        if let Some(record) = record_map.get(add_path) {
+            if validate_path(repo_root, &record.path).is_err() {
+                new_manifest_files.push(ManifestFileEntry {
+                    path: record.path.clone(),
+                    content_sha: record.content_sha.clone(),
+                    size_bytes: record.size,
+                    language: record.language.clone(),
+                    status: "skipped".into(),
+                    skipped_reason: Some("path_unsafe".into()),
+                });
+                continue;
+            }
+
+            let full_path = repo_root.join(&record.path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    new_manifest_files.push(ManifestFileEntry {
+                        path: record.path.clone(),
+                        content_sha: record.content_sha.clone(),
+                        size_bytes: record.size,
+                        language: record.language.clone(),
+                        status: "skipped".into(),
+                        skipped_reason: Some("read_error".into()),
+                    });
+                    continue;
+                }
+            };
+
+            let current_sha = blake3::hash(content.as_bytes()).to_hex().to_string();
+            let lines: Vec<&str> = content.lines().collect();
+            let total_lines = lines.len() as u64;
+
+            if total_lines == 0 {
+                new_manifest_files.push(ManifestFileEntry {
+                    path: record.path.clone(),
+                    content_sha: current_sha,
+                    size_bytes: record.size,
+                    language: record.language.clone(),
+                    status: "skipped".into(),
+                    skipped_reason: Some("empty_file".into()),
+                });
+                continue;
+            }
+
+            let chunks = compute_chunks(
+                &record.path,
+                &record.language,
+                &content,
+                total_lines,
+                &chunk_strategy,
+                &mut AstManifestStats::default(),
+            );
+
+            for (start_line, end_line) in &chunks {
+                let start_idx = (*start_line - 1) as usize;
+                let end_idx = *end_line as usize;
+                let chunk_content = if start_idx < lines.len() && end_idx <= lines.len() {
+                    lines[start_idx..end_idx].join("\n")
+                } else {
+                    continue;
+                };
+
+                index_writer.add_document(doc!(
+                    path_field => record.path.as_str(),
+                    language_field => record.language.as_str(),
+                    content_sha_field => current_sha.as_str(),
+                    start_line_field => *start_line,
+                    end_line_field => *end_line,
+                    content_field => chunk_content.as_str(),
+                ))?;
+
+                total_new_chunks += 1;
+            }
+
+            new_manifest_files.push(ManifestFileEntry {
+                path: record.path.clone(),
+                content_sha: current_sha,
+                size_bytes: record.size,
+                language: record.language.clone(),
+                status: "indexed".into(),
+                skipped_reason: None,
+            });
+
+            total_added += 1;
+        }
+    }
+
+    // Commit once after batch
+    index_writer.commit()?;
+
+    let commit_ms = start.elapsed().as_millis() as u64;
+
+    // Write manifest atomically (tmp + rename)
+    let new_file_count = new_manifest_files
+        .iter()
+        .filter(|f| f.status == "indexed")
+        .count() as u64;
+    // Compute new chunk_count: old count minus deleted chunks, plus new chunks
+    // For simplicity, recompute: old_chunk_count - estimated_deleted_chunks + total_new_chunks
+    // But we don't know deleted_chunks precisely; use total_new_chunks as the delta for added/modified
+    // and subtract a rough estimate for deleted. Instead, let's compute from the new manifest
+    // by counting chunks per file (approximation: we track total_new_chunks which is additions+modifications)
+    let new_chunk_count =
+        manifest.chunk_count + total_new_chunks - (total_deleted * 2).min(manifest.chunk_count); // rough estimate
+
+    let new_manifest = IndexManifest {
+        schema_version: manifest.schema_version.clone(),
+        file_count: new_file_count,
+        chunk_count: new_chunk_count,
+        policy_hash: current_policy_hash,
+        files: new_manifest_files,
+        chunk_strategy: manifest.chunk_strategy.clone(),
+        ast_stats: manifest.ast_stats.clone(),
+    };
+
+    // Atomic write: write to tmp then rename
+    let manifest_path = repo_root.join(MANIFEST_PATH_RELATIVE);
+    if let Some(parent) = manifest_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_manifest_path = manifest_path.with_extension("json.tmp");
+    let content = serde_json::to_string_pretty(&new_manifest)
+        .with_context(|| "failed to serialize manifest")?;
+    std::fs::write(&tmp_manifest_path, &content)
+        .with_context(|| "failed to write temp manifest")?;
+    std::fs::rename(&tmp_manifest_path, &manifest_path)
+        .with_context(|| "failed to rename temp manifest")?;
+
+    // Check post-update status
+    let post_dirty = dirty_index(repo_root, policy, current_records)?;
+    let post_status_clean = post_dirty.clean;
+
+    Ok(UpdateResult {
+        success: true,
+        added_count: total_added,
+        modified_count: total_modified,
+        deleted_count: total_deleted,
+        commit_ms,
+        manifest_written: true,
+        post_status_clean,
+        error: None,
+    })
+}
+
+/// Compute chunks for a file based on the given strategy.
+/// Extracted from build_index to be reusable by update_index.
+fn compute_chunks(
+    path: &str,
+    language: &str,
+    content: &str,
+    total_lines: u64,
+    chunk_strategy: &ChunkStrategy,
+    _ast_stats: &mut AstManifestStats,
+) -> Vec<(u64, u64)> {
+    match chunk_strategy {
+        ChunkStrategy::LineWindowV1 => {
+            let mut chunks = Vec::new();
+            let mut chunk_start = 0u64;
+            while chunk_start < total_lines {
+                let chunk_end = (chunk_start + MAX_CHUNK_LINES).min(total_lines);
+                chunks.push((chunk_start + 1, chunk_end)); // 1-based
+                chunk_start = chunk_end;
+            }
+            chunks
+        }
+        ChunkStrategy::AstV1 => {
+            let ast_result = extract_ast_chunks(path, language, content, MAX_CHUNK_LINES);
+            ast_result
+                .chunks
+                .iter()
+                .map(|c| (c.start_line, c.end_line))
+                .collect()
+        }
+    }
+}
+
 // ── Validate ───────────────────────────────────────────────────────────
 
 /// Full validation result.
@@ -1690,5 +2380,550 @@ mod tests {
         );
         let open_err = format!("{}", open_result.err().unwrap());
         assert!(open_err.contains("manifest missing"));
+    }
+
+    #[test]
+    fn dirty_clean_after_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        let dirty = dirty_index(root, &policy, &records).unwrap();
+        assert!(dirty.clean);
+        assert!(!dirty.requires_update);
+        assert!(!dirty.requires_rebuild);
+        assert!(dirty.added_files.is_empty());
+        assert!(dirty.modified_files.is_empty());
+        assert!(dirty.deleted_files.is_empty());
+        assert!(dirty.policy_hash_matches);
+        assert!(dirty.schema_matches);
+    }
+
+    #[test]
+    fn dirty_detects_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn old() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Modify file
+        std::fs::write(root.join("a.rs"), "fn new() {}\nfn extra() {}\n").unwrap();
+
+        // Re-scan to get updated records (but the old ones are fine for dirty check)
+        let dirty = dirty_index(root, &policy, &records).unwrap();
+        assert!(!dirty.clean);
+        assert!(dirty.requires_update);
+        assert!(dirty.modified_files.contains(&"a.rs".to_string()));
+    }
+
+    #[test]
+    fn dirty_detects_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Delete file
+        std::fs::remove_file(root.join("a.rs")).unwrap();
+
+        let dirty = dirty_index(root, &policy, &[]).unwrap();
+        assert!(!dirty.clean);
+        assert!(dirty.deleted_files.contains(&"a.rs".to_string()));
+    }
+
+    #[test]
+    fn dirty_detects_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Add a new file
+        std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+        let new_records = vec![
+            FileRecord {
+                path: "a.rs".into(),
+                size: 0,
+                content_sha: compute_sha(root, "a.rs"),
+                language: "rust".into(),
+            },
+            FileRecord {
+                path: "b.rs".into(),
+                size: 0,
+                content_sha: compute_sha(root, "b.rs"),
+                language: "rust".into(),
+            },
+        ];
+
+        let dirty = dirty_index(root, &policy, &new_records).unwrap();
+        assert!(!dirty.clean);
+        assert!(dirty.added_files.contains(&"b.rs".to_string()));
+    }
+
+    #[test]
+    fn dirty_no_index_requires_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let policy = Policy::default();
+        let dirty = dirty_index(root, &policy, &[]).unwrap();
+        assert!(dirty.requires_rebuild);
+        assert!(!dirty.clean);
+    }
+
+    #[test]
+    fn update_dirty_modified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn authenticate() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Modify file
+        std::fs::write(root.join("a.rs"), "fn authorize() {}\nfn extra() {}\n").unwrap();
+
+        // Re-scan
+        let new_records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let result = update_index(root, &policy, &new_records, true, None).unwrap();
+        assert!(result.success);
+        assert_eq!(result.modified_count, 1);
+        assert!(result.post_status_clean);
+
+        // Search should find the new content
+        let (evidence, _) = search_persistent_bm25(root, "authorize", 10, &policy).unwrap();
+        assert!(!evidence.is_empty(), "should find updated content");
+    }
+
+    #[test]
+    fn update_dirty_added_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn authenticate() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Add a new file
+        std::fs::write(root.join("b.rs"), "fn new_function() {}\n").unwrap();
+        let new_records = vec![
+            FileRecord {
+                path: "a.rs".into(),
+                size: 0,
+                content_sha: compute_sha(root, "a.rs"),
+                language: "rust".into(),
+            },
+            FileRecord {
+                path: "b.rs".into(),
+                size: 0,
+                content_sha: compute_sha(root, "b.rs"),
+                language: "rust".into(),
+            },
+        ];
+
+        let result = update_index(root, &policy, &new_records, true, None).unwrap();
+        assert!(result.success);
+        assert_eq!(result.added_count, 1);
+        assert!(result.post_status_clean);
+
+        // Search should find the new file
+        let (evidence, _) = search_persistent_bm25(root, "new_function", 10, &policy).unwrap();
+        assert!(!evidence.is_empty(), "should find newly added file");
+    }
+
+    #[test]
+    fn update_dirty_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn authenticate() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn other() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![
+            FileRecord {
+                path: "a.rs".into(),
+                size: 0,
+                content_sha: compute_sha(root, "a.rs"),
+                language: "rust".into(),
+            },
+            FileRecord {
+                path: "b.rs".into(),
+                size: 0,
+                content_sha: compute_sha(root, "b.rs"),
+                language: "rust".into(),
+            },
+        ];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Delete file b.rs
+        std::fs::remove_file(root.join("b.rs")).unwrap();
+
+        let new_records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let result = update_index(root, &policy, &new_records, true, None).unwrap();
+        assert!(result.success);
+        assert_eq!(result.deleted_count, 1);
+        assert!(result.post_status_clean);
+
+        // Search should not find deleted file
+        let (evidence, _) = search_persistent_bm25(root, "other", 10, &policy).unwrap();
+        assert!(
+            evidence.is_empty(),
+            "deleted file should not appear in search"
+        );
+    }
+
+    #[test]
+    fn update_refuses_missing_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let policy = Policy::default();
+        let result = update_index(root, &policy, &[], true, None).unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("manifest missing"));
+    }
+
+    #[test]
+    fn update_refuses_policy_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        let mut different_policy = Policy::default();
+        different_policy.remote.allow = true;
+
+        let result = update_index(root, &different_policy, &records, true, None).unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let err = result.error.unwrap();
+        assert!(err.contains("policy hash mismatch"), "got: {}", err);
+    }
+
+    #[test]
+    fn update_single_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn authenticate() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Modify file
+        std::fs::write(root.join("a.rs"), "fn authorize() {}\nfn extra() {}\n").unwrap();
+
+        let new_records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let result = update_index(root, &policy, &new_records, false, Some("a.rs")).unwrap();
+        assert!(result.success);
+        assert_eq!(result.modified_count, 1);
+        assert!(result.post_status_clean);
+    }
+
+    #[test]
+    fn dirty_skipped_empty_file_clean_after_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Empty policy-included file → skipped in manifest
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "empty.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "empty.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Dirty should report clean (skipped entry, sha unchanged)
+        let dirty = dirty_index(root, &policy, &records).unwrap();
+        assert!(
+            dirty.clean,
+            "skipped empty file should not dirty: {:?}",
+            dirty
+        );
+        assert!(!dirty.requires_update);
+        // Should NOT appear in added_files
+        assert!(
+            !dirty.added_files.contains(&"empty.rs".to_string()),
+            "skipped empty file should not be in added_files: {:?}",
+            dirty.added_files
+        );
+    }
+
+    #[test]
+    fn dirty_skipped_to_nonempty_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Empty file → skipped
+        std::fs::write(root.join("grow.rs"), "").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "grow.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "grow.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // File becomes non-empty
+        std::fs::write(root.join("grow.rs"), "fn new_content() {}\n").unwrap();
+        let new_records = vec![FileRecord {
+            path: "grow.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "grow.rs"),
+            language: "rust".into(),
+        }];
+
+        let dirty = dirty_index(root, &policy, &new_records).unwrap();
+        assert!(!dirty.clean, "skipped→nonempty should dirty");
+        assert!(dirty.requires_update);
+        // Should appear in modified_files, NOT added_files
+        assert!(
+            dirty.modified_files.contains(&"grow.rs".to_string()),
+            "skipped→nonempty should be in modified_files: {:?}",
+            dirty.modified_files
+        );
+        assert!(
+            !dirty.added_files.contains(&"grow.rs".to_string()),
+            "skipped→nonempty should NOT be in added_files: {:?}",
+            dirty.added_files
+        );
+    }
+
+    #[test]
+    fn update_skipped_to_nonempty_promotes_to_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Empty file → skipped
+        std::fs::write(root.join("grow.rs"), "").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "grow.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "grow.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // File becomes non-empty
+        std::fs::write(root.join("grow.rs"), "fn searchable_content() {}\n").unwrap();
+        let new_records = vec![FileRecord {
+            path: "grow.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "grow.rs"),
+            language: "rust".into(),
+        }];
+
+        let result = update_index(root, &policy, &new_records, true, None).unwrap();
+        assert!(result.success);
+        assert!(
+            result.modified_count >= 1,
+            "skipped→nonempty should count as modified"
+        );
+        assert!(result.post_status_clean);
+
+        // Should now be searchable
+        let (evidence, _) =
+            search_persistent_bm25(root, "searchable_content", 10, &policy).unwrap();
+        assert!(!evidence.is_empty(), "promoted file should be searchable");
+    }
+
+    #[test]
+    fn dirty_skipped_unchanged_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Empty file → skipped
+        std::fs::write(root.join("skip.rs"), "").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "skip.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "skip.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // File still empty — no change
+        let dirty = dirty_index(root, &policy, &records).unwrap();
+        assert!(dirty.clean, "unchanged skipped file should be clean");
+    }
+
+    #[test]
+    fn update_refuses_schema_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Corrupt the schema version in the manifest by writing raw JSON
+        let manifest_path = root.join(MANIFEST_PATH_RELATIVE);
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let corrupted = raw.replace("\"r8-bm25-v2\"", "\"unknown-v99\"");
+        std::fs::write(&manifest_path, corrupted).unwrap();
+
+        // dirty_index should require rebuild due to load failure
+        let dirty = dirty_index(root, &policy, &records);
+        if let Ok(d) = dirty {
+            assert!(d.requires_rebuild, "should require rebuild for bad schema");
+        }
+
+        // update_index should also fail
+        let result = update_index(root, &policy, &records, true, None).unwrap();
+        assert!(!result.success, "should refuse update for bad schema");
+    }
+
+    #[test]
+    fn update_refuses_chunk_strategy_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+
+        let policy = Policy::default();
+        let records = vec![FileRecord {
+            path: "a.rs".into(),
+            size: 0,
+            content_sha: compute_sha(root, "a.rs"),
+            language: "rust".into(),
+        }];
+
+        let _ = build_index(root, &records, &policy, ChunkStrategy::LineWindowV1).unwrap();
+
+        // Corrupt chunk_strategy in the manifest by writing raw JSON
+        let manifest_path = root.join(MANIFEST_PATH_RELATIVE);
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let corrupted = raw.replace("\"line_window_v1\"", "\"unknown_strategy\"");
+        std::fs::write(&manifest_path, corrupted).unwrap();
+
+        // dirty_index should require rebuild due to load failure
+        let dirty = dirty_index(root, &policy, &records);
+        if let Ok(d) = dirty {
+            assert!(
+                d.requires_rebuild,
+                "should require rebuild for bad strategy"
+            );
+        }
+
+        // update_index should also fail
+        let result = update_index(root, &policy, &records, true, None).unwrap();
+        assert!(!result.success, "should refuse update for bad strategy");
     }
 }

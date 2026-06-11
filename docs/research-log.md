@@ -485,7 +485,7 @@ Note: These are implementation notes and initial SLO measurements on a small sel
 
 ### Caveats carried forward
 
-- This is a Level0 persistent index implementation only. No incremental update; `build_index` is always a full rebuild.
+- This is a Level0 persistent index implementation. Incremental update added in R10; the index still becomes stale when files change until `index update --dirty` is run.
 - The manifest stores per-file content_sha at build time; it does not track per-chunk sha. If a file changes, all chunks from that file are considered stale (conservative).
 - Warm SLO numbers are from a small self-referential codebase snapshot. Performance on larger repos may differ significantly.
 - Persistent index does not integrate with RRF or fast-context pipelines yet; it is accessible only via `search bm25 --index persistent`.
@@ -574,7 +574,7 @@ AST-bounded chunks should improve retrieval precision by aligning chunk boundari
 - Tree-sitter parsers may have edge cases or version-specific behavior. The quality of chunking depends on the grammar quality.
 - AST symbol extraction does not handle all possible symbol patterns (e.g., re-exports, aliased imports, nested definitions). Regex fallback covers many of these.
 - The `auto` mode for symbol search tries AST first for supported files and falls back to regex if no results. This may miss cases where regex finds results that AST does not.
-- No incremental update for AST index; `build_index` is always a full rebuild.
+- No incremental update for AST index in this R8 iteration; R10 adds incremental update for both line and ast strategies.
 - Manifest schema version `r8-bm25-v2` is not compatible with `r7-bm25-v1` for search purposes (older schemas load but may require rebuild for search).
 - AST chunking adds Tree-sitter as a dependency, increasing binary size and compile time.
 
@@ -593,17 +593,17 @@ AST-bounded chunks should improve span-level precision/recall (SpanF0.5@10) by a
 | Metric | line | ast | delta |
 |---|---:|---:|---:|
 | FileRecall@1 | 0.393 | 0.536 | +0.143 |
-| FileRecall@5 | 0.821 | 0.786 | −0.036 |
+| FileRecall@5 | 0.821 | 0.750 | −0.071 |
 | FileRecall@10 | 0.821 | 0.821 | 0.000 |
-| MRR | 0.556 | 0.631 | +0.075 |
-| SpanF0.5@10 | 0.040 | 0.065 | +0.025 |
-| token_waste_ratio@10 | 0.960 | 0.938 | −0.022 |
-| wrong_span_rate@10 | 0.780 | 0.693 | −0.086 |
+| MRR | 0.548 | 0.624 | +0.076 |
+| SpanF0.5@10 | 0.039 | 0.064 | +0.025 |
+| token_waste_ratio@10 | 0.961 | 0.940 | −0.022 |
+| wrong_span_rate@10 | 0.776 | 0.689 | −0.087 |
 | zero_overlap_evidence_rate@10 | 0.950 | 0.913 | −0.038 |
 | citation_validity | 1.0 | 1.0 | 0.0 |
 | structural_validity | 1.0 | 1.0 | 0.0 |
 | success_rate | 1.0 | 1.0 | 0.0 |
-| avg_latency_ms | ~10.9 | ~10.3 | noisy/comparable |
+| avg_latency_ms | ~10.4 | ~9.1 | noisy/comparable |
 | latency_ratio | — | ~1.0 | noisy |
 
 ### Quality gate
@@ -612,10 +612,10 @@ AST-bounded chunks should improve span-level precision/recall (SpanF0.5@10) by a
 |---|---|
 | Both citation_validity == 1.0 | ✅ |
 | Both success_rate == 1.0 | ✅ |
-| AST FileRecall@5 ≥ line | ❌ (0.786 < 0.821) |
-| AST SpanF0.5@10 ≥ line | ✅ (0.065 > 0.040) |
-| AST token_waste not worse | ✅ (0.938 < 0.960) |
-| Latency ratio ≤ 1.25 | ✅ (comparable; latest run ~0.94) |
+| AST FileRecall@5 ≥ line | ❌ (0.750 < 0.821) |
+| AST SpanF0.5@10 ≥ line | ✅ (0.064 > 0.039) |
+| AST token_waste not worse | ✅ (0.940 < 0.961) |
+| Latency ratio ≤ 1.25 | ✅ (comparable; latest run ~0.88) |
 | **Overall quality_gate_passed** | **false** (FileRecall@5 regression) |
 
 ### Safety checks
@@ -636,12 +636,12 @@ AST-bounded chunks should improve span-level precision/recall (SpanF0.5@10) by a
 
 ### Key findings
 
-1. **AST improves SpanF0.5@10 by +0.025** (0.040 → 0.065, +62% relative). AST-bounded chunks align better with logical code structures, producing evidence spans that overlap gold lines more often. This is the strongest positive signal for AST chunking.
+1. **AST improves SpanF0.5@10 by +0.025** (0.039 → 0.064, ~63% relative in the latest run). AST-bounded chunks align better with logical code structures, producing evidence spans that overlap gold lines more often. This is the strongest positive signal for AST chunking.
 2. **AST improves FileRecall@1 by +0.143** (0.393 → 0.536, +36% relative). The finer-grained AST chunks appear to help top-1 file retrieval, likely because more specific chunks match queries more precisely at the top rank.
-3. **AST regresses FileRecall@5 by −0.036** (0.821 → 0.786). This is the quality gate failure. AST chunking produces more, smaller chunks (e.g., 15 chunks vs 5 for a 5-file repo), which can dilute BM25 scores for some files, causing them to rank outside top-5. This is a real trade-off: finer chunks help precision at k=1 but may hurt recall at higher k because the same file's chunks compete with each other.
-4. **AST reduces token_waste_ratio@10 by −0.022** (0.960 → 0.938). Narrower, more targeted evidence spans waste fewer tokens on irrelevant lines. The improvement is modest on this fixture.
-5. **AST reduces wrong_span_rate@10 by −0.086** (0.780 → 0.693). AST-bounded evidence on gold files is more likely to overlap gold spans, reducing the rate of evidence that hits the right file but the wrong location.
-6. **Latency is comparable/noisy** (latest ratio ~0.94). Both strategies have similar per-query latency in this tiny CLI benchmark; this is not a general performance claim.
+3. **AST regresses FileRecall@5 by −0.071** (0.821 → 0.750 in the latest run). This is the quality gate failure. AST chunking produces more, smaller chunks (e.g., 15 chunks vs 5 for a 5-file repo), which can dilute BM25 scores for some files, causing them to rank outside top-5. This is a real trade-off: finer chunks help precision at k=1 but may hurt recall at higher k because the same file's chunks compete with each other.
+4. **AST reduces token_waste_ratio@10 by −0.022** (0.961 → 0.940 in the latest run). Narrower, more targeted evidence spans waste fewer tokens on irrelevant lines. The improvement is modest on this fixture.
+5. **AST reduces wrong_span_rate@10 by −0.087** (0.776 → 0.689 in the latest run). AST-bounded evidence on gold files is more likely to overlap gold spans, reducing the rate of evidence that hits the right file but the wrong location.
+6. **Latency is comparable/noisy** (latest ratio ~0.88). Both strategies have similar per-query latency in this tiny CLI benchmark; this is not a general performance claim.
 7. **Citation validity and structural validity are perfect for both strategies** (1.0). AST chunking does not compromise evidence safety.
 8. **Quality gate is false** due to FileRecall@5 regression. This is a negative result on the gate but not on safety. The gate correctly captures the trade-off.
 
@@ -657,8 +657,132 @@ Whether this trade-off is acceptable depends on the use case: for top-1 precisio
 
 - Fixture is R2 small self-referential (28 tasks, ~20 source files). Results are not generalisable.
 - FileRecall@5 regression may be an artifact of chunk granularity on small repos; larger repos may not exhibit the same trade-off.
-- No incremental indexing; bakeoff rebuilds the full index for each strategy.
+- No incremental indexing in this R9 bakeoff; R10 adds incremental update.
 - The bakeoff only tests persistent BM25; temp BM25, RRF, and fast-context are not compared here.
 - token_waste_ratio remains high (~0.94) for both strategies. The bottleneck is query-evidence alignment, not chunking strategy.
 - Python citation validation uses path_range_only mode (no blake3 Python package installed); Rust CLI citation validator confirmed invalid_count=0 for both strategies.
 - AST mode is experimental and opt-in. Line-window chunking remains the default and recommended strategy.
+
+## 2026-06-11 — R10 Incremental Index + Dirty Summary + Synthetic SLO
+
+### Objective
+
+Add persistent index dirty summary, file-level incremental update, context-lite dirty integration, and synthetic SLO benchmark. Do not implement TDB/daemon/watcher. Do not add LLM/dense. EvidenceCore unchanged.
+
+### Current hypothesis
+
+A manifest-vs-filesystem dirty summary enables incremental index updates that avoid full rebuilds for small changes. File-level update with Tantivy delete-by-term + re-add should correctly maintain the index without producing duplicate or stale evidence. Policy/schema/strategy mismatches must refuse update, requiring rebuild instead. Note: the Tantivy commit and manifest file write are not a single transaction; failure between them may leave a safe but inconsistent state requiring rebuild or re-update.
+
+### Implementation notes
+
+- **Dirty summary** (`dirty_index`): Computes manifest-vs-current scan returning `DirtyResult` with:
+  - `clean`: bool (true if no changes and policy/schema match)
+  - `requires_update`: bool (true if added/modified/deleted files, no rebuild needed)
+  - `requires_rebuild`: bool (true if policy/schema/strategy mismatch or no index)
+  - `added_files`, `modified_files`, `deleted_files`: arrays of path strings
+  - `added_count`, `modified_count`, `deleted_count`: u64 counts
+  - `policy_hash_matches`, `schema_matches`: bool flags
+  - `chunk_strategy`: from manifest
+  - Discovers policy-included added files not in manifest; policy-excluded added files do not dirty.
+  - Status must not say clean if validate would fail.
+
+- **File-level update** (`update_index`): CLI: `openlocus index update --dirty --json` and/or `openlocus index update --path <path> --json`.
+  - If index/manifest missing → error (requires rebuild).
+  - If policy hash/schema/strategy mismatch → refuse update, require rebuild.
+  - For `--dirty`: compute added/modified/deleted from dirty summary, then:
+    - Delete old Tantivy docs by path using `Term::from_field_text(path_field, path)`.
+    - For added/modified policy-included files: validate_path, read current file, compute sha, chunk according to manifest chunk_strategy, add docs.
+    - For deleted files: delete docs by path, remove manifest entry.
+    - Commit once after batch.
+    - Write manifest file using tmp+rename (not a single transaction with Tantivy commit; failure between may require rebuild/update).
+  - Added detection uses ALL manifest paths (indexed + skipped), not just indexed. Skipped entries with unchanged sha remain clean; skipped→nonempty is reported as modified (not added).
+  - For `--path`: update only that policy-included path. If file exists add/update; if missing delete from index. Validate path safety.
+  - Returns `UpdateResult` with `added_count`, `modified_count`, `deleted_count`, `commit_ms`, `manifest_written`, `post_status_clean`.
+  - Tantivy deletes are tombstones until merge; documented, not a bug.
+  - Prevents duplicate old+new docs by delete_term(path) before add.
+  - Chunk according to manifest chunk_strategy; does not mix strategies.
+
+- **Context-lite integration**: R10 populates dirty-summary.json with actual dirty index status (clean, requires_update, requires_rebuild, added/modified/deleted counts and files) instead of the R1 empty placeholder. If index doesn't exist, reports requires_rebuild=true.
+
+- **CLI commands**:
+  - `openlocus index dirty --json`: Show dirty summary.
+  - `openlocus index update --dirty --json`: Update all dirty files.
+  - `openlocus index update --path <path> --json`: Update single file.
+
+- **Eval scripts**:
+  - `eval/incremental_index_smoke.py`: 48 safety checks covering build/clean, modify/update/search/clean, add/update/search/clean, delete/update/search/clean, rename simulation, policy-excluded no dirty, policy mismatch refuses update, missing manifest refuses update, skipped empty file clean/promotion, schema/strategy mismatch refuses update, citations invalid_count=0.
+  - `eval/synthetic_slo_bench.py`: Deterministic 1000-file synthetic repo (mix .rs/.py/.ts/.md/.txt), measures build_ms, dirty status latency, persistent_cli_search p95, bench_warm open-once query p95, and one-file update latency (true modification each iteration). Validates no invalid citations. Level0 synthetic only; no broad performance claims.
+
+### R10 incremental index smoke results (48/48 checks passed)
+
+| Check | Result |
+|---|---|
+| Build succeeds, file_count > 0 | ✅ |
+| Dirty clean after build | ✅ |
+| Dirty: no requires_update/rebuild after build | ✅ |
+| Dirty: policy_hash_matches + schema_matches | ✅ |
+| Modify file → dirty detects modified | ✅ |
+| Search before update: no stale VerifiedCurrent | ✅ |
+| Update dirty: modifies file, manifest written | ✅ |
+| Search after update: finds new content | ✅ |
+| Dirty clean after update | ✅ |
+| Add new file → dirty detects added | ✅ |
+| Update dirty: adds file | ✅ |
+| Search finds added file | ✅ |
+| Dirty clean after add update | ✅ |
+| Delete file → dirty detects deleted | ✅ |
+| Update dirty: deletes file | ✅ |
+| Search: no evidence for deleted file | ✅ |
+| Dirty clean after delete update | ✅ |
+| Rename: old gone, new found | ✅ |
+| Policy-excluded added file does not dirty | ✅ |
+| Policy hash mismatch refuses update | ✅ |
+| Missing manifest refuses update | ✅ |
+| Citations: invalid_count=0 | ✅ |
+| Purge after smoke succeeds | ✅ |
+
+### R10 synthetic SLO benchmark results (1000 files, seed=42)
+
+```json
+{
+  "build_ms": 147,
+  "build_file_count": 1000,
+  "build_chunk_count": 1072,
+  "dirty_status_latency_ms": {"p50": 44, "p95": 48, "max": 48},
+  "dirty_clean": true,
+  "persistent_cli_search_latency_ms": {"p50": 13, "p95": 14, "max": 15},
+  "bench_warm": {"index_open_ms": 5, "queries": 10, "iterations": 3, "warm_query_p50_ms": 0, "warm_query_p95_ms": 0, "warm_query_max_ms": 1, "invalid_citations": 0},
+  "total_invalid_citations": 0,
+  "one_file_update_latency_ms": {"p50": 115, "p95": 117, "max": 126},
+  "update_success": true,
+  "update_modified_count_ok": true,
+  "all_safety_checks_passed": true
+}
+```
+
+Note: These are Level0 synthetic-only measurements on a deterministic 1000-file fixture. They are not a general performance claim. Actual performance on real-world repos will vary with file sizes, content diversity, and hardware. `persistent_cli_search_latency_ms` measures CLI search (each call opens index fresh); `bench_warm` reports the Rust CLI's internal open-once query latency over a synthetic dataset. The dirty_status_latency includes a full file rescan which is bounded by the number of indexed files; for very large repos this would need optimization (e.g., filesystem watchers, mtimes). One-file update latency reflects a true modification (different content each iteration), not a no-op.
+
+### Key findings
+
+1. **Incremental update works correctly**: Modified, added, and deleted files are properly detected, updated in the Tantivy index, and the manifest is written using tmp+rename. Post-update status shows clean.
+2. **Dirty summary is accurate**: It correctly identifies added/modified/deleted files, distinguishes requires_update from requires_rebuild, and does not report policy-excluded files as dirty.
+3. **Safety gates are enforced**: Policy hash mismatch and missing manifest refuse update with clear error messages. Schema and strategy mismatches also refuse update.
+4. **Search-after-update correctness**: After updating modified files, persistent search returns only new content (verified_current freshness). After deleting files, no evidence appears. After adding files, new files are discoverable.
+5. **Tantivy delete-by-term works**: Using `Term::from_field_text(path_field, path)` correctly removes all chunks for a given path before re-adding, preventing duplicate old+new docs.
+6. **Manifest file write uses tmp+rename**: This prevents partial manifest writes. However, the Tantivy commit and manifest write are not a single transaction; a crash between them may leave a safe but inconsistent state (Tantivy committed but manifest stale), requiring a rebuild or re-update.
+7. **One-file update latency is reasonable for synthetic small edits**: ~115ms p50 for a true single-file update in a 1000-file repo (dev profile, unoptimized). This includes scan + dirty computation + Tantivy write + manifest write.
+8. **Dirty status latency scales with file count**: ~44ms p50 for 1000 files in dev build. For very large repos, filesystem watchers or mtime-based optimization would be needed.
+9. **Context-lite dirty summary is now written to file**: R10 replaces the R1 empty placeholder by writing actual dirty counts and status information to `.openlocus/context/dirty-summary.json`. The `ContextLitePack.dirty_summary` struct field remains `None` (the file is the authoritative source, not the struct field).
+
+### Caveats
+
+- This is a Level0 incremental index implementation. Not a daemon/watcher; index becomes stale when files change and must be manually updated via `index update --dirty` or `--path`.
+- Tantivy deletes are tombstones until merge. For repos with frequent updates, periodic full rebuild or explicit merge may be needed to reclaim space.
+- Chunk count in manifest after update is approximate (old_count + new_chunks - estimated_deleted_chunks). A full rebuild produces exact counts.
+- Dirty summary re-scans all indexed files to compare content_sha. For very large repos, this is O(n) in indexed file count. A filesystem watcher or mtime cache would be needed for sub-second dirty detection.
+- The update does not handle branch switches or concurrent modifications; a rebuild is recommended after significant changes.
+- AST strategy update uses the same `compute_chunks` helper as build; it respects the manifest's chunk_strategy and does not mix strategies.
+- The Tantivy commit and manifest file write are not a single transaction. If the process crashes between them, the index may be in a safe but inconsistent state (Tantivy committed, manifest stale). A rebuild or re-update resolves this.
+- Skipped entries (empty files, read errors, path_unsafe) are tracked in the manifest; they do not appear as "added" on subsequent dirty scans if sha is unchanged. A skipped→nonempty transition is reported as "modified" and the update promotes it to "indexed".
+- R7/R8/R9 smoke tests still pass after R10 changes.
+- TDB moves to a later research stage (was R10 in original roadmap, now deferred to R11).

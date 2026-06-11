@@ -13,10 +13,10 @@ use openlocus_derived::store::JsonlDerivedViewStore;
 use openlocus_derived::validation;
 use openlocus_graph::graph::{self, EdgeKind, GraphEdge};
 use openlocus_graph::materialize::materialize_graph_edges;
-use openlocus_index::manifest::ChunkStrategy;
+use openlocus_index::manifest::{ChunkStrategy, IndexManifest};
 use openlocus_index::persistent::{
-    PersistentBm25Index, build_index, purge_index, search_persistent_bm25, status_index,
-    validate_index,
+    PersistentBm25Index, build_index, dirty_index, purge_index, search_persistent_bm25,
+    status_index, update_index, validate_index,
 };
 use openlocus_repo::read::read_file;
 use openlocus_repo::scan::scan_repo;
@@ -337,8 +337,26 @@ pub enum IndexCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Show dirty summary (manifest-vs-current scan)
+    Dirty {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate persistent index against filesystem
     Validate {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Incrementally update persistent index
+    Update {
+        /// Update all dirty files (added/modified/deleted)
+        #[arg(long)]
+        dirty: bool,
+        /// Update a single file path
+        #[arg(long)]
+        path: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -950,6 +968,17 @@ pub fn run() -> Result<()> {
                 );
                 print_output(&result, json)
             }
+            IndexCommands::Dirty { json } => {
+                let records = scan_repo(&repo_root, &policy)?;
+                let result = dirty_index(&repo_root, &policy, &records)?;
+                trace_event(
+                    &repo_root,
+                    "index_dirty",
+                    serde_json::json!({}),
+                    serde_json::json!({"clean": result.clean, "requires_update": result.requires_update, "requires_rebuild": result.requires_rebuild}),
+                );
+                print_output(&result, json)
+            }
             IndexCommands::Validate { json } => {
                 let result = validate_index(&repo_root, &policy)?;
                 trace_event(
@@ -957,6 +986,17 @@ pub fn run() -> Result<()> {
                     "index_validate",
                     serde_json::json!({}),
                     serde_json::json!({"valid": result.valid, "stale_files": result.stale_files.len(), "deleted_files": result.deleted_files.len()}),
+                );
+                print_output(&result, json)
+            }
+            IndexCommands::Update { dirty, path, json } => {
+                let records = scan_repo(&repo_root, &policy)?;
+                let result = update_index(&repo_root, &policy, &records, dirty, path.as_deref())?;
+                trace_event(
+                    &repo_root,
+                    "index_update",
+                    serde_json::json!({"dirty": dirty, "path": path}),
+                    serde_json::json!({"success": result.success, "added_count": result.added_count, "modified_count": result.modified_count, "deleted_count": result.deleted_count}),
                 );
                 print_output(&result, json)
             }
@@ -1143,14 +1183,48 @@ fn build_context_lite(repo_root: &Path, write_files: bool) -> Result<ContextLite
         fs::create_dir_all(&ctx_dir)?;
 
         let dirty_summary_path = ctx_dir.join("dirty-summary.json");
-        let dirty_summary = serde_json::json!({
-            "repo_root": repo_root.to_string_lossy(),
-            "timestamp": Utc::now().to_rfc3339(),
-            "dirty_files": []
-        });
+        // R10: populate dirty summary with actual index status
+        let dirty_data = if IndexManifest::exists(repo_root) {
+            let policy = Policy::load_from_repo(repo_root);
+            let records = scan_repo(repo_root, &policy)?;
+            let dirty_result = dirty_index(repo_root, &policy, &records)?;
+            serde_json::json!({
+                "repo_root": repo_root.to_string_lossy(),
+                "timestamp": Utc::now().to_rfc3339(),
+                "clean": dirty_result.clean,
+                "requires_update": dirty_result.requires_update,
+                "requires_rebuild": dirty_result.requires_rebuild,
+                "added_count": dirty_result.added_count,
+                "modified_count": dirty_result.modified_count,
+                "deleted_count": dirty_result.deleted_count,
+                "added_files": dirty_result.added_files,
+                "modified_files": dirty_result.modified_files,
+                "deleted_files": dirty_result.deleted_files,
+                "policy_hash_matches": dirty_result.policy_hash_matches,
+                "schema_matches": dirty_result.schema_matches,
+                "chunk_strategy": dirty_result.chunk_strategy,
+            })
+        } else {
+            serde_json::json!({
+                "repo_root": repo_root.to_string_lossy(),
+                "timestamp": Utc::now().to_rfc3339(),
+                "clean": false,
+                "requires_update": false,
+                "requires_rebuild": true,
+                "added_count": 0,
+                "modified_count": 0,
+                "deleted_count": 0,
+                "added_files": [],
+                "modified_files": [],
+                "deleted_files": [],
+                "policy_hash_matches": false,
+                "schema_matches": false,
+                "chunk_strategy": null,
+            })
+        };
         fs::write(
             &dirty_summary_path,
-            serde_json::to_string_pretty(&dirty_summary)?,
+            serde_json::to_string_pretty(&dirty_data)?,
         )?;
         generated_files.push(".openlocus/context/dirty-summary.json".into());
 

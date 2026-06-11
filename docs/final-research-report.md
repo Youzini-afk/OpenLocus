@@ -1,14 +1,14 @@
-# OpenLocus R0-R9 Research Report
+# OpenLocus R0-R10 Research Report
 
 Date: 2026-06-11  
 Repository: `https://github.com/Youzini-afk/OpenLocus.git`  
-Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R9 AST quality bakeoff milestone.
+Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R10 incremental index + dirty summary + synthetic SLO milestone.
 
 ## Executive summary
 
 OpenLocus now has a working Rust prototype that validates the core design direction: **all agent-facing code facts must be evidence-backed, citation-checkable, and freshness-aware**.
 
-The implementation completed eight evidence-gated milestones:
+The implementation completed ten evidence-gated checkpoints:
 
 | Commit | Stage | Result |
 |---|---|---|
@@ -21,17 +21,18 @@ The implementation completed eight evidence-gated milestones:
 | `43135ed` | R7 persistent BM25 index | Persistent Tantivy index with mandatory manifest/policy gates, safe hit validation, and warm benchmark. |
 | R8 checkpoint | R8 AST chunking/symbols | Tree-sitter AST-bounded chunking and AST symbol search as explicit experimental modes. |
 | R9 checkpoint | R9 AST quality bakeoff | Persistent BM25 quality comparison: line vs ast on R2 fixture. AST improves span precision but regresses FileRecall@5. |
+| R10 checkpoint | R10 incremental index + dirty summary + synthetic SLO | Dirty summary (manifest-vs-current scan), file-level incremental update, context-lite dirty integration, synthetic 1000-file SLO benchmark. 48/48 incremental smoke checks passed. |
 
 Final verification snapshot:
 
 ```text
-Rust tests: 176 passed
+Rust tests: 193 passed
 fmt: clean
 clippy: clean with -D warnings
 Remote dependency: none
 LLM dependency: none
 TDB dependency: none (placeholder only)
-Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed
+Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed; incremental index smoke 48/48 checks passed; synthetic SLO bench 0 invalid citations
 ```
 
 The most important research outcome is not that retrieval quality is solved. It is that the project now has a **safe experimental harness** where BM25, graph, TDB, LLM-derived views, dense embeddings, and future planners can be tested without weakening the EvidenceCore contract.
@@ -93,7 +94,10 @@ openlocus tests --path <path> --json
 openlocus fast-context <query> --json
 openlocus index build --chunk-strategy line|ast --json
 openlocus index status --json
+openlocus index dirty --json
 openlocus index validate --json
+openlocus index update --dirty --json
+openlocus index update --path <path> --json
 openlocus index purge --json
 openlocus bench warm --dataset fixtures/r2.jsonl --iterations 3 --json
 ```
@@ -330,14 +334,14 @@ R2 fixture results (28 tasks, persistent BM25):
 | Metric | line | ast | delta |
 |---|---:|---:|---:|
 | FileRecall@1 | 0.393 | 0.536 | +0.143 |
-| FileRecall@5 | 0.821 | 0.786 | −0.036 |
+| FileRecall@5 | 0.821 | 0.750 | −0.071 |
 | FileRecall@10 | 0.821 | 0.821 | 0.000 |
-| MRR | 0.556 | 0.631 | +0.075 |
-| SpanF0.5@10 | 0.040 | 0.065 | +0.025 |
-| token_waste_ratio@10 | 0.960 | 0.938 | −0.022 |
-| wrong_span_rate@10 | 0.780 | 0.693 | −0.086 |
+| MRR | 0.548 | 0.624 | +0.076 |
+| SpanF0.5@10 | 0.039 | 0.064 | +0.025 |
+| token_waste_ratio@10 | 0.961 | 0.940 | −0.022 |
+| wrong_span_rate@10 | 0.776 | 0.689 | −0.087 |
 | citation_validity | 1.0 | 1.0 | 0.0 |
-| avg_latency_ms | ~10.9 | ~10.3 | noisy/comparable |
+| avg_latency_ms | ~10.4 | ~9.1 | noisy/comparable |
 | latency_ratio | — | ~1.0 | — |
 
 Quality gate: **false** (AST FileRecall@5 < line).  
@@ -345,17 +349,63 @@ Safety checks: **16/16 passed**.
 
 Key finding:
 
-- AST improves span precision (SpanF0.5@10 +62% relative, token_waste −2.2pp, wrong_span_rate −8.6pp) and top-1 recall (+36% relative), but regresses FileRecall@5 (−3.6pp) due to chunk-score dilution: more granular AST chunks scatter a file's BM25 signal, reducing the chance that any single chunk ranks the file into top-5.
+- AST improves span precision (SpanF0.5@10 ~+63% relative, token_waste −2.2pp, wrong_span_rate −8.7pp) and top-1 recall (+36% relative), but regresses FileRecall@5 (−7.1pp in the latest run) due to chunk-score dilution: more granular AST chunks scatter a file's BM25 signal, reducing the chance that any single chunk ranks the file into top-5.
 - This is a real trade-off, not a bug. The fixture is too small and self-referential to generalise.
 - **AST remains experimental/opt-in; line remains default.** A larger, diverse codebase eval would be needed for a definitive quality comparison.
 
 Status: safety checks all pass; quality gate is false due to FileRecall@5 regression. This is a valid negative result on a small self-referential fixture.
 
+### R10 — incremental index, dirty summary, and synthetic SLO
+
+Goal: add persistent index dirty summary, file-level incremental update, context-lite dirty integration, and synthetic SLO benchmark without implementing TDB/daemon/watcher or LLM/dense.
+
+Implemented:
+
+ - `dirty_index(repo_root, policy, current_records)`: Manifest-vs-current scan returning `DirtyResult` with clean, requires_update, requires_rebuild, added/modified/deleted files and counts, policy_hash_matches, schema_matches, chunk_strategy. Added detection uses ALL manifest paths (indexed+skipped). Skipped entries with unchanged sha remain clean; skipped→nonempty is reported as modified (not added).
+ - `update_index(repo_root, policy, current_records, dirty, path)`: File-level incremental update via `--dirty` (batch) or `--path` (single file). Safety gates: missing manifest, policy/schema/strategy mismatch, manifest load failure → refuse update. Tantivy delete-by-term + re-add, commit once, manifest file write via tmp+rename (not a single transaction with Tantivy commit; crash between may require rebuild or re-update).
+ - CLI: `openlocus index dirty --json`, `openlocus index update --dirty --json`, `openlocus index update --path <path> --json`.
+ - Context-lite writes dirty-summary.json file with actual dirty index status; `ContextLitePack.dirty_summary` struct field remains `None` (file is the surface).
+ - `eval/incremental_index_smoke.py`: 48 safety checks covering build/clean, modify/update/search/clean, add/update/search/clean, delete/update/search/clean, rename simulation, policy-excluded no dirty, policy mismatch refuses update, missing manifest refuses update, skipped empty file clean/promotion, schema/strategy mismatch refuses update, citations invalid_count=0.
+ - `eval/synthetic_slo_bench.py`: Deterministic 1000-file synthetic repo, measures build_ms, dirty status latency, persistent_cli_search p95, bench-warm open-once query p95, and one-file update latency (true modification each iteration). 0 invalid citations.
+
+Critical gates:
+
+- Missing manifest → error (requires rebuild); no silent fallback.
+- Policy hash/schema/strategy mismatch → refuse update, require rebuild.
+- Manifest load failure (corrupt JSON, unknown schema/strategy) → refuse update gracefully, require rebuild.
+- Tantivy delete-by-term before add prevents duplicate old+new docs.
+- Manifest file write uses tmp+rename to prevent partial writes; but this is not a single transaction with Tantivy commit (crash between may require rebuild or re-update).
+- Chunk strategy from manifest is respected; no strategy mixing.
+- Tantivy deletes are tombstones until merge (documented, not a bug).
+- Added detection uses ALL manifest paths (indexed+skipped); skipped entries with unchanged sha do not appear as added.
+
+Incremental smoke: 48/48 checks passed.
+
+Synthetic SLO (1000 files, seed=42, dev profile):
+
+```text
+build_ms: 147
+dirty_status_latency p50: 44ms, p95: 48ms
+persistent_cli_search_latency p50: 13ms, p95: 14ms
+bench_warm open-once query latency p50: 0ms, p95: 0ms, max: 1ms
+one_file_update_latency p50: 115ms, p95: 117ms (true modification each iteration)
+total_invalid_citations: 0
+```
+
+Note: Level0 synthetic-only measurements. Not a general performance claim. `persistent_cli_search_latency_ms` measures CLI search (each call opens index fresh). `bench_warm` reports the Rust CLI's internal open-once query latency over a synthetic dataset.
+
+Key finding:
+
+- Incremental update works correctly and safely: dirty summary accurately identifies changes (skipped entries with unchanged sha remain clean; skipped→nonempty reported as modified, not added), update applies batch changes (Tantivy commit + manifest file write via tmp+rename, not a single transaction), post-update status is clean, and persistent search returns only current content.
+- TDB is deferred to R11; R10 focuses on incremental index infrastructure.
+
+Status: passed Level0 smoke (48/48 incremental checks + synthetic SLO).
+
 ## Cross-stage findings
 
 ### 1. EvidenceCore stayed stable
 
-R0-R9 did not require changing the core evidence contract. Research features were added around it:
+R0-R10 did not require changing the core evidence contract. Research features were added around it:
 
 - storage uses StoreHit candidates;
 - derived indexing uses DerivedIndexView;
@@ -363,6 +413,7 @@ R0-R9 did not require changing the core evidence contract. Research features wer
 - fast-context outputs EvidencePack-compatible wrappers.
 - persistent BM25 uses Tantivy hits plus mandatory manifest/policy gates, then materializes from the current filesystem before output.
 - AST chunking/symbol extraction only changes candidate boundaries; it still materializes final Evidence from current filesystem validation.
+- Incremental update uses Tantivy delete-by-term + re-add with the same materialization path; no new evidence bypass.
 
 This validates the original “small and hard” contract design.
 
@@ -422,7 +473,12 @@ The storage scaffold keeps TDB in scope while avoiding premature commitment. The
 This prototype is intentionally not production-ready.
 
 - Default BM25 still builds a temporary index per query unless `--index persistent` is explicitly selected.
-- Persistent Tantivy is implemented at Level0, but updates are full rebuild only; there is no incremental/watch mode yet.
+- Persistent Tantivy is implemented at Level0 with incremental update (R10); updates are file-level via --dirty or --path. No daemon/watch mode yet.
+- Incremental update chunk count is approximate after update; full rebuild produces exact counts.
+- Tantivy deletes are tombstones until merge; periodic full rebuild recommended for frequently-updated repos.
+- Tantivy commit and manifest file write are not a single transaction; crash between may leave a safe but inconsistent state requiring rebuild or re-update.
+- Dirty summary re-scans all indexed files (O(n)); filesystem watchers or mtime caching needed for very large repos.
+- Skipped entries (empty files, read errors, path_unsafe) are tracked in manifest; they do not appear as "added" on subsequent dirty scans if sha is unchanged.
 - ConservativeChunkStore is in-memory and ephemeral.
 - TDB is a placeholder only; no real TriviumDB code is linked.
 - LLM indexing is a deterministic safety scaffold only; no real model/provider is used.
@@ -432,24 +488,11 @@ This prototype is intentionally not production-ready.
 - Fast Context is fixed-rule orchestration, not adaptive planning.
 - Token budget uses chars/4 approximation, not a tokenizer.
 - Policy globbing is simple and needs a mature matcher before broad use.
-- Warm-index SLO has only been measured on a small self-referential repo; larger-repo results are unknown.
+- Warm-index SLO now has Level0 synthetic measurement only; larger real-repo behavior is still unknown.
 
 ## Recommended next research stages
 
-### R9 — AST quality bakeoff and persistent index incrementality
-
-Priority: high.
-
-**R9 partial completion**: AST vs line quality bakeoff completed (see R9 stage results above). AST improves SpanF0.5@10 and FileRecall@1 but regresses FileRecall@5 on the small fixture. AST remains experimental/opt-in; line remains default. Remaining R9 work: extend persistent indexes from full rebuild to incremental updates and run warm/cold SLO measurements on larger repositories.
-
-Gate (incrementality part, still pending):
-
-- dirty overlay/update p95 near P0 target;
-- no stale verified evidence after edit/delete/rename;
-- branch switch does not mix stale manifests;
-- warm persistent search remains inside target on medium repos.
-
-### R10 — real TDB adapter behind feature flag
+### R11 — real TDB adapter behind feature flag
 
 Priority: medium-high.
 
@@ -461,7 +504,24 @@ Gate:
 - corruption/purge/rebuild behavior understood;
 - quality/latency/resource comparison against conservative track.
 
-### R11 — remote embedding and LLM-derived indexing bakeoffs
+### R12 — real-repo incremental robustness benchmark
+
+Priority: high.
+
+R10 proved a Level0 synthetic incremental loop. The next indexing-specific stage should test real repositories and branch/change workloads:
+
+- dirty/update latency on multiple real repos;
+- branch switch behavior;
+- crash/recovery around Tantivy commit vs manifest write;
+- tombstone/segment growth and optional compaction.
+
+Gate:
+
+- no stale VerifiedCurrent evidence;
+- update path remains faster than full rebuild for small edits;
+- dirty status remains honest under adds/deletes/renames/excludes.
+
+### R13 — remote embedding and LLM-derived indexing bakeoffs
 
 Priority: medium-high.
 
@@ -477,7 +537,7 @@ Gate:
 - no policy regression;
 - graceful degradation when provider unavailable.
 
-### R12 — graph precision upgrade
+### R14 — graph precision upgrade
 
 Priority: medium.
 
@@ -489,7 +549,7 @@ Gate:
 - depth>1 remains opt-in;
 - graph results still materialize through StoreHit.
 
-### R13 — Fast Context quality bakeoff
+### R15 — Fast Context quality bakeoff
 
 Priority: medium.
 
@@ -512,6 +572,7 @@ The current implementation successfully converts the research design into a work
 - retrieval method bakeoff harness;
 - storage, derived-index, graph, persistent-index, and fast-context safety scaffolds;
 - AST vs line quality bakeoff with measurable span precision improvement;
+- incremental index with dirty summary and file-level update;
 - pushed checkpoints for each stage.
 
-The next phase should not rush into a full LLM/dense/TDB system. The safest path is to first make the local baseline incrementally maintained (R9 remaining work), then plug TDB, dense vectors, and LLM-derived views into the same evidence-gated harness.
+The next phase should not rush into a full LLM/dense/TDB system. The safest path is to first ensure incremental index is robust on real repos (R10 complete), then plug TDB, dense vectors, and LLM-derived views into the same evidence-gated harness.
