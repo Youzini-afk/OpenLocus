@@ -23,6 +23,7 @@ openlocus-graph = { path = "../openlocus-graph" }
 openlocus-index = { path = "../openlocus-index" }
 openlocus-repo = { path = "../openlocus-repo" }
 openlocus-retrieval = { path = "../openlocus-retrieval" }
+openlocus-provider = { path = "../openlocus-provider" }
 openlocus-store = { path = "../openlocus-store" }
 serde.workspace = true
 serde_json.workspace = true

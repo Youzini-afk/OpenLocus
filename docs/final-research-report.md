@@ -1,14 +1,14 @@
-# OpenLocus R0-R12 Research Report
+# OpenLocus R0-R13 Research Report
 
 Date: 2026-06-11  
 Repository: `https://github.com/Youzini-afk/OpenLocus.git`  
-Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R12 real-repo incremental robustness benchmark milestone.
+Scope: continuous evidence-gated research implementation from the initial design into a working local retrieval kernel prototype, now including the R13 remote embedding / LLM-derived indexing safety scaffold milestone.
 
 ## Executive summary
 
 OpenLocus now has a working Rust prototype that validates the core design direction: **all agent-facing code facts must be evidence-backed, citation-checkable, and freshness-aware**.
 
-The implementation completed twelve evidence-gated checkpoints:
+The implementation completed thirteen evidence-gated checkpoints:
 
 | Commit | Stage | Result |
 |---|---|---|
@@ -24,17 +24,18 @@ The implementation completed twelve evidence-gated checkpoints:
 | R10 checkpoint | R10 incremental index + dirty summary + synthetic SLO | Dirty summary (manifest-vs-current scan), file-level incremental update, context-lite dirty integration, synthetic 1000-file SLO benchmark. 48/48 incremental smoke checks passed. |
 | R11 checkpoint | R11 TDB Level0 adapter probe | Feature-gated TriviumDB 0.7.0 adapter behind `tdb` Cargo feature. TdbChunkStore with dim=1 smoke probe, metadata+chunks only, marker-based purge, materialization conformance. 11/11 adapter checks passed. No default dependency. No retrieval quality claim. |
 | R12 checkpoint | R12 real-repo incremental robustness benchmark | eval/real_repo_incremental_bench.py on temp copy of OpenLocus repo. modify/add/delete/rename/policy_exclude/batch workloads pass 149/149 hard safety checks. total_invalid_citations=0. No stale VerifiedCurrent violations. Growth catastrophic guard passed (not bounded proof). Latency measured as report-only. Level0 one real-repo sample only. |
+| R13 checkpoint | R13 remote embedding / LLM-derived indexing safety scaffold | New `openlocus-provider` crate with EmbeddingProvider trait, MockEmbeddingProvider (deterministic blake3 vectors, dim=32), DisabledEmbeddingProvider. Policy gate: remote denied by default, data_level ≤1 and ≤provider max, secret scanning. Dense JSONL store contains vectors but no raw text/code. Audit JSONL contains no raw text/vector/query. Search → StoreHit → materialize_evidence(Channel::Dense). CLI: provider status/audit, dense build/search/purge; dense output uses query_sha/query_len. 45/45 safety checks passed. Mock quality only; not real semantic retrieval. |
 
 Final verification snapshot:
 
 ```text
-Rust tests: 193 passed
+Rust tests: 243 passed (193 existing + 50 new in openlocus-provider)
 fmt: clean
 clippy: clean with -D warnings
 Remote dependency: none
 LLM dependency: none
 TDB dependency: optional only (behind `tdb` feature; not in default build)
-Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed; incremental index smoke 48/48 checks passed; synthetic SLO bench 0 invalid citations; TDB adapter probe 11/11 checks passed; real-repo incremental bench 149/149 hard safety checks passed
+Safety evals: storage, derived, graph, fast-context, persistent-index, AST-chunking all passing their Level0 gates; AST quality bakeoff safety checks 16/16 passed; incremental index smoke 48/48 checks passed; synthetic SLO bench 0 invalid citations; TDB adapter probe 11/11 checks passed; real-repo incremental bench 149/149 hard safety checks passed; provider dense safety 45/45 checks passed
 ```
 
 The most important research outcome is not that retrieval quality is solved. It is that the project now has a **safe experimental harness** where BM25, graph, TDB, LLM-derived views, dense embeddings, and future planners can be tested without weakening the EvidenceCore contract.
@@ -72,8 +73,9 @@ crates/openlocus-store      Store traits, StoreHit materialization, conservative
 crates/openlocus-derived    DerivedIndexView safety scaffold
 crates/openlocus-graph      deterministic graph scaffold + graph materialization
 crates/openlocus-context    Fast Context Level0 rule loop
+crates/openlocus-provider   EmbeddingProvider trait, MockEmbeddingProvider, DisabledEmbeddingProvider, policy gate, secret scanner, dense JSONL store, embedding audit
 crates/openlocus-cli        user-facing CLI
-eval/                       retrieval/storage/derived/graph/fast-context/persistent-index/AST smoke and scoring scripts
+eval/                       retrieval/storage/derived/graph/fast-context/persistent-index/AST/provider-dense smoke and scoring scripts
 docs/                       research log, summary, agent guide, final report
 ```
 
@@ -102,6 +104,11 @@ openlocus index update --dirty --json
 openlocus index update --path <path> --json
 openlocus index purge --json
 openlocus bench warm --dataset fixtures/r2.jsonl --iterations 3 --json
+openlocus provider status --json
+openlocus provider audit --limit 20 --json
+openlocus dense build --provider mock --experimental --json
+openlocus dense search <query> --provider mock --limit 10 --json
+openlocus dense purge --json
 ```
 
 ## Stage results
@@ -640,21 +647,43 @@ Gate:
 - dirty status remains honest under adds/deletes/renames/excludes ✅;
 - collected marker-search evidence validated; not "all evidence in repo".
 
-### R13 — remote embedding and LLM-derived indexing bakeoffs
+### R13 — remote embedding and LLM-derived indexing safety scaffold
 
-Priority: medium-high.
+Goal: add a safe scaffold for future dense/semantic embedding and LLM-derived indexing experiments, without connecting to any real remote service.
 
-Add provider policy, audit logging, secret gate, and cache keys before any outbound call. Test:
+Implemented:
 
-- dense semantic retrieval;
-- LLM `chunk_summary` / `query_aliases` as retrieval hints;
-- no-snippet/signature-only modes.
+- New crate `openlocus-provider` with `EmbeddingProvider` trait, `MockEmbeddingProvider` (deterministic blake3-based vectors, dimensions=32, no network), `DisabledEmbeddingProvider`.
+- `ProviderLocality` enum: Disabled, Mock, Local, Remote.
+- `ProviderMetadata` with provider_id, model_id, dimensions, locality, max_data_level, outbound_possible.
+- `EmbedInput` with data_level, policy_mode, purpose; text field skipped in serialization.
+- `EmbeddingRecord` stored in JSONL: path, range, source_content_sha, language, text_sha, vector (no raw text; vectors present for search).
+- `EmbeddingAuditEvent` written as JSONL: timestamp, event, provider_id, model_id, locality, purpose, path, line_range, data_level, view_kind, bytes_selected, text_sha, secret_scan, policy_decision, cache_key, outbound_attempted, reason (no raw text, vector, or query text in audit).
+- Policy gate (`gate_embed_input`): Remote requires policy.remote.allow + allow_embedding + provider in allowed list + data_level gate. Mock/Local: data_level ≤ 1 AND data_level ≤ metadata.max_data_level. Secret gate blocks SECRET/TOKEN/PASSWORD/API_KEY/PRIVATE_KEY/sk_/ghp_/AKIA and high-entropy strings.
+- Cache key: `emb1:` + blake3 hex from canonical string with schema_version + provider_id + model_id + dimensions + view_kind + text_sha + source_content_sha + policy_mode + data_level. Cache key builder/stability only; no cache-hit behavior yet.
+- Dense JSONL store (`JsonlEmbeddingStore`) at `.openlocus/embeddings/vectors.jsonl`: build from FileRecords with metadata-only views (path/language/basename/path-tokens, no code snippets at data_level=0); build uses real line counts: end_line=min(total_lines, 8) for valid ranges; cosine similarity search; StoreHit → `materialize_evidence(Channel::Dense)`.
+- Audit writer at `.openlocus/audit/embeddings.jsonl`. Audit events use accurate names: `allow`, `block`, `query_embed`, `provider_unavailable` (not `cache_hit` unless real cache).
+- CLI uses query_sha/query_len instead of raw query text in JSON output and trace events.
+- CLI: `provider status --json`, `provider audit --limit N --json`, `dense build --provider mock --experimental --json`, `dense search <query> --provider mock --limit N --json`, `dense purge --json`.
+- Disabled/unknown provider: audit event written with policy_decision=deny, event=provider_unavailable.
+- Eval: `eval/provider_dense_safety.py` with 45 safety checks.
+
+R13 implemented the safety scaffold for dense/LLM-derived indexing:
+
+- All 45 safety checks pass: remote_default=false, outbound_default=false, experimental gate, audit contains no raw text/vector/query, vector store contains vectors but no raw text/code snippet, stale hit rejection, secret blocking, disabled/unknown provider graceful degradation with audit events, missing store graceful error, citation validity, short file range correctness, CLI JSON uses query_sha not raw query, audit event naming correct (no cache_hit), cache key stability (unit tests).
+- Mock provider vectors are deterministic and normalized; no network dependency.
+- Dense search produces StoreHits → materialize_evidence(Channel::Dense); stale hits correctly rejected.
+- No real semantic quality claim. Mock vectors are blake3-based; they do not capture semantic similarity. Dense mock search is integration/safety only.
 
 Gate:
 
-- quality gain measured in eval;
-- no policy regression;
-- graceful degradation when provider unavailable.
+- audit contains no raw text/vector/query; vector store contains embedding vectors but no raw text/code snippet ✅;
+- remote denied by default ✅;
+- experimental opt-in required ✅;
+- secret scanning blocks token-like inputs ✅;
+- graceful degradation when provider unavailable (with audit event) ✅;
+- 45/45 safety checks passed ✅;
+- mock quality only — not a real semantic retrieval claim.
 
 ### R14 — graph precision upgrade
 
@@ -694,6 +723,13 @@ The current implementation successfully converts the research design into a work
 - incremental index with dirty summary and file-level update;
 - feature-gated TriviumDB Level0 adapter probe;
 - real-repo incremental robustness benchmark (modify/add/delete/rename/policy-exclude/batch/latency/growth);
+- provider/embedding safety scaffold with mock provider, policy gate, secret scanning, dense JSONL store, and embedding audit (45/45 safety checks passed);
 - pushed checkpoints for each stage.
 
-The next phase should not rush into a full LLM/dense/TDB system. The safest path is to continue testing incremental robustness on more real repositories (R12 completed one OpenLocus temp-copy sample), then extend TDB to meaningful search quality (R11 adapter probe complete), plug in dense vectors and LLM-derived views into the same evidence-gated harness, and run bakeoffs against the conservative baseline.
+The next phase should not rush into a full LLM/dense/TDB system. The safest path is to continue testing incremental robustness on more real repositories (R12 completed one OpenLocus temp-copy sample), then extend TDB to meaningful search quality (R11 adapter probe complete), plug in real embedding providers behind the existing policy gate (R13 scaffold ready), and run bakeoffs against the conservative baseline.
+
+### Recommended next stages
+
+- **R14 graph precision**: Add Tree-sitter/LSP/SCIP-like graph adapters behind the same graph model. Keep heuristic graph as baseline. Gate: impact/test-selection fixture improvement; depth>1 opt-in; graph results still materialize through StoreHit.
+- **R15 fast-context quality bakeoff**: Compare `openlocus fast-context` against `retrieve` over larger task sets. Add ablations: no graph, no symbol, BM25 only, derived hints, dense hints. Gate: no citation regressions; budget violations=0; FileRecall/MRR/SpanF0.5 improve or stay within allowed regression.
+- **R16 real remote embedding after policy review**: Integrate real embedding providers (e.g. OpenAI, local ONNX) behind the R13 policy gate. Requires policy review, API key management, and cost tracking. Gate: quality gain measured in eval; no policy regression; graceful degradation when provider unavailable; audit trail complete.

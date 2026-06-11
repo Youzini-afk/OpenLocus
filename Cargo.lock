@@ -949,6 +949,7 @@ dependencies = [
  "openlocus-derived",
  "openlocus-graph",
  "openlocus-index",
+ "openlocus-provider",
  "openlocus-repo",
  "openlocus-retrieval",
  "openlocus-store",
@@ -1029,6 +1030,22 @@ dependencies = [
  "tantivy",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "openlocus-provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "openlocus-core",
+ "openlocus-repo",
+ "openlocus-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

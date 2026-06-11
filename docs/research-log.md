@@ -1004,3 +1004,84 @@ Incremental update is ~42% faster than full rebuild for both single-file and bat
 - No crash/recovery testing between Tantivy commit and manifest write.
 - Branch-like batch does not actually switch git branches; it simulates the file-level effects of a branch switch.
 - Collected marker-search evidence is validated; this is not "all evidence in repo" — only evidence from workload-specific marker searches.
+
+## 2026-06-11 — R13 Remote Embedding / LLM-Derived Indexing Bakeoff Safety Scaffold
+
+### Objective
+
+Add a safe scaffold for future dense/semantic embedding and LLM-derived indexing experiments, without connecting to any real remote service, reading API keys, downloading models, or adding reqwest/async-openai/fastembed/ANN DB dependencies.
+
+### Design constraints
+
+- No real remote calls, no API key reads, no model downloads.
+- Default build is fully local; EvidenceCore is unchanged.
+- Dense/mock/derived hints produce candidate StoreHits only; final Evidence must go through `openlocus_store::materialize_evidence(repo_root, hit, Channel::Dense)`.
+- Audit never stores raw snippet text or vectors; vector store stores path/range/source_content_sha/language/vector but not raw text/code snippet.
+- CLI/trace/audit never store raw query text; use query_sha + query_len instead.
+- Quality claims limited to mock integration; no real semantic gain claimed.
+
+### Implementation
+
+1. **New crate `openlocus-provider`** with modules:
+   - `model.rs`: `ProviderLocality`, `ProviderMetadata`, `EmbedInput`, `EmbeddingRecord`, `EmbeddingAuditEvent`, `ProviderDecision`.
+   - `provider.rs`: `EmbeddingProvider` trait, `DisabledEmbeddingProvider`, `create_provider()`.
+   - `mock.rs`: `MockEmbeddingProvider` — deterministic vector from blake3(provider_id/model_id/text_sha/index), normalized, dimensions=32, no network.
+   - `gate.rs`: `gate_embed_input()` — Remote requires policy.remote.allow + allow_embedding + provider in allowed list + data_level gate. Mock/Local: data_level ≤ 1 AND data_level ≤ metadata.max_data_level. Secret gate blocks SECRET/TOKEN/PASSWORD/API_KEY/PRIVATE_KEY/sk_/ghp_/AKIA and high-entropy strings.
+   - `cache.rs`: Domain-separated stable cache key with `emb1:` prefix + blake3 hex. Cache key builder/stability only; no cache-hit behavior yet.
+   - `audit.rs`: JSONL audit writer at `.openlocus/audit/embeddings.jsonl`; no raw text/vector in audit events. Audit events use accurate names: `allow`, `block`, `query_embed`, `provider_unavailable` (not `cache_hit` unless real cache).
+   - `dense_store.rs`: `JsonlEmbeddingStore` at `.openlocus/embeddings/vectors.jsonl`. Build from FileRecords with metadata-only views (`path:<path> language:<language> basename:<stem> words:<path tokens>`, no code snippet). Build uses real line counts: end_line=min(total_lines, 8), so short files get valid ranges. Cosine similarity search. Store `EmbeddingRecord` (no raw text; vector present for search).
+
+2. **CLI additions**:
+   - `openlocus provider status --json`: reports remote_default=false, outbound_default=false, supported providers [mock, disabled].
+   - `openlocus provider audit --limit N --json`: reads audit JSONL, outputs events (no raw text).
+   - `openlocus dense build --provider mock --experimental --json`: requires --experimental; builds vector store from metadata-only views.
+   - `openlocus dense search <query> --provider mock --limit N --json`: embeds query, searches by cosine, materializes StoreHits via `materialize_evidence(Channel::Dense)`. CLI JSON uses query_sha/query_len instead of raw query text.
+   - `openlocus dense purge --json`: removes vector store.
+
+3. **Eval script** `eval/provider_dense_safety.py`: 45 safety checks covering remote/outbound defaults, experimental gate, vector/audit no raw text, secret blocking, stale hit rejection, disabled/unknown provider graceful degradation, missing store graceful error, cache key stability, short file range correctness, query SHA not raw query, audit event naming, trace no raw query/secret.
+
+### Verification
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 eval/provider_dense_safety.py --openlocus target/debug/openlocus --out runs/provider-dense-safety.json
+```
+
+### Safety checks
+
+45/45 safety checks passed:
+- remote_default=false, outbound_default=false
+- build without --experimental fails
+- build with --experimental --provider mock succeeds with remote_calls=0
+- vectors.jsonl exists, contains no raw code marker, no "text" field, valid ranges
+- audit JSONL exists, has events, no raw marker, no "vector" field, no "text" field, no "cache_hit" event
+- dense search returns citation-valid Evidence (Channel::Dense, freshness=verified_current)
+- stale hit after file modification is skipped (materialize rejects stale SHA)
+- disabled/unknown provider degrades gracefully (no panic, success=false), audit event written
+- secret-like query text (sk_ prefix) is blocked; no raw secret in CLI JSON/audit/traces
+- CLI JSON uses query_sha/query_len, not raw query field
+- short file range is correct (end_line=min(total_lines, 8))
+- missing store returns graceful error
+- audit_raw_text_leak=false, remote_calls=0, citation_invalid_count=0
+
+### Key findings
+
+1. **Safe scaffold works**: All gates are functional. Remote is denied by default. Experimental opt-in is required. Secret scanning blocks token-like inputs. Audit contains no raw text or vectors. Vector store contains embedding vectors but no raw text/code snippet.
+2. **Mock provider is deterministic and normalized**: Same inputs always produce the same unit-length vector. Different inputs produce different vectors. No network dependency.
+3. **Materialization gate is essential**: Dense search produces StoreHits which must be materialized through `materialize_evidence()`. Stale hits (content_sha mismatch) are correctly rejected.
+4. **Metadata-only views prevent code leakage**: The dense store builds views from path/language/basename/path-tokens only. No code snippets are included at data_level=0. The vector store and audit log do not contain raw code text.
+5. **Short file ranges are now valid**: end_line=min(total_lines, 8) ensures materialize_evidence can verify ranges. Short files produce valid evidence.
+6. **Query text never leaks**: CLI JSON uses query_sha/query_len. Trace events use query_sha. Audit never stores raw query text. Blocked secret queries do not appear in traces.
+7. **Audit events use accurate names**: `query_embed` for query embedding, `allow`/`block`/`provider_unavailable` for decisions. Not `cache_hit` (no real cache behavior in R13).
+8. **This is a safety scaffold only. No real semantic quality claim.** Mock vectors are deterministic blake3-based and do not capture semantic similarity. Dense mock search is integration/safety only.
+
+### Caveats
+
+- Mock provider vectors are deterministic but not semantically meaningful. Quality claims are limited to mock integration.
+- The dense store builds one record per file (metadata view only). Future work could add chunk-level views with real embeddings.
+- No real remote provider is implemented. The gate infrastructure is in place for future R14+ integration.
+- Cache is not yet used for deduplication (build always recomputes). Cache key stability is verified by unit tests. Cache key builder/stability only; no cache-hit behavior yet.
+- No ANN index; cosine search is linear scan over all records. Not suitable for large corpus.
+- Dense mock search is integration/safety only; not a real semantic retrieval claim.

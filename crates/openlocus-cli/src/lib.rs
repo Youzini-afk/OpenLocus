@@ -18,6 +18,9 @@ use openlocus_index::persistent::{
     PersistentBm25Index, build_index, dirty_index, purge_index, search_persistent_bm25,
     status_index, update_index, validate_index,
 };
+use openlocus_provider::audit;
+use openlocus_provider::dense_store::JsonlEmbeddingStore;
+use openlocus_provider::provider::{self, EmbeddingProvider};
 use openlocus_repo::read::read_file;
 use openlocus_repo::scan::scan_repo;
 use openlocus_repo::validate_path;
@@ -156,6 +159,16 @@ pub enum Commands {
     },
     /// Print version
     Version,
+    /// Provider status and audit (experimental)
+    Provider {
+        #[command(subcommand)]
+        provider_cmd: ProviderCommands,
+    },
+    /// Dense embedding search (experimental)
+    Dense {
+        #[command(subcommand)]
+        dense_cmd: DenseCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -379,6 +392,61 @@ pub enum BenchCommands {
         /// Number of iterations
         #[arg(long, default_value_t = 3)]
         iterations: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProviderCommands {
+    /// Show provider status
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show embedding audit log
+    Audit {
+        /// Maximum events to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DenseCommands {
+    /// Build dense embedding index
+    Build {
+        /// Provider to use (only "mock" supported in R13)
+        #[arg(long, default_value = "mock")]
+        provider: String,
+        /// Must be set to enable experimental dense indexing
+        #[arg(long)]
+        experimental: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search with dense embeddings
+    Search {
+        /// Query text
+        query: String,
+        /// Provider to use (only "mock" supported in R13)
+        #[arg(long, default_value = "mock")]
+        provider: String,
+        /// Maximum results
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Purge dense embedding index
+    Purge {
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1027,6 +1095,70 @@ pub fn run() -> Result<()> {
                         "warm_query_p50_ms": result.warm_query_p50_ms,
                         "warm_query_p95_ms": result.warm_query_p95_ms,
                     }),
+                );
+                print_output(&result, json)
+            }
+        },
+        Commands::Provider { provider_cmd } => match provider_cmd {
+            ProviderCommands::Status { json } => {
+                let result = provider_status(&repo_root);
+                trace_event(
+                    &repo_root,
+                    "provider_status",
+                    serde_json::json!({}),
+                    serde_json::json!({"remote_default": result.remote_default, "outbound_default": result.outbound_default}),
+                );
+                print_output(&result, json)
+            }
+            ProviderCommands::Audit { limit, json } => {
+                let result = provider_audit(&repo_root, limit)?;
+                trace_event(
+                    &repo_root,
+                    "provider_audit",
+                    serde_json::json!({"limit": limit}),
+                    serde_json::json!({"event_count": result.events.len()}),
+                );
+                print_output(&result, json)
+            }
+        },
+        Commands::Dense { dense_cmd } => match dense_cmd {
+            DenseCommands::Build {
+                provider: provider_name,
+                experimental,
+                json,
+            } => {
+                let result = dense_build(&repo_root, &policy, &provider_name, experimental)?;
+                trace_event(
+                    &repo_root,
+                    "dense_build",
+                    serde_json::json!({"provider": provider_name, "experimental": experimental}),
+                    serde_json::json!({"success": result.success, "record_count": result.record_count}),
+                );
+                print_output(&result, json)
+            }
+            DenseCommands::Search {
+                query,
+                provider: provider_name,
+                limit,
+                json,
+            } => {
+                let result = dense_search(&repo_root, &policy, &query, &provider_name, limit)?;
+                let query_sha = blake3::hash(query.as_bytes()).to_hex().to_string();
+                trace_event(
+                    &repo_root,
+                    "dense_search",
+                    serde_json::json!({"query_sha": query_sha, "query_len": query.len(), "provider": provider_name, "limit": limit}),
+                    serde_json::json!({"success": result.success, "evidence_count": result.evidence.len(), "skipped_count": result.skipped_count}),
+                );
+                print_output(&result, json)
+            }
+            DenseCommands::Purge { json } => {
+                let result = dense_purge(&repo_root)?;
+                trace_event(
+                    &repo_root,
+                    "dense_purge",
+                    serde_json::json!({}),
+                    serde_json::json!({"purged": result.purged}),
                 );
                 print_output(&result, json)
             }
@@ -1928,4 +2060,372 @@ fn percentile(sorted: &[u64], p: u64) -> u64 {
     }
     let idx = ((p as usize) * (sorted.len() - 1)) / 100;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+// ── Provider/Dense helpers ──────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProviderStatusResult {
+    success: bool,
+    remote_default: bool,
+    outbound_default: bool,
+    supported_providers: Vec<String>,
+    audit_path: String,
+    policy_mode: String,
+}
+
+fn provider_status(repo_root: &Path) -> ProviderStatusResult {
+    let audit_path = repo_root
+        .join(openlocus_provider::audit::AUDIT_RELATIVE_PATH)
+        .to_str()
+        .unwrap_or_default()
+        .to_string();
+    ProviderStatusResult {
+        success: true,
+        remote_default: false,
+        outbound_default: false,
+        supported_providers: vec!["mock".into(), "disabled".into()],
+        audit_path,
+        policy_mode: "local_only".into(),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProviderAuditResult {
+    success: bool,
+    event_count: usize,
+    events: Vec<serde_json::Value>,
+}
+
+fn provider_audit(repo_root: &Path, limit: usize) -> Result<ProviderAuditResult> {
+    let events = audit::read_audit_events(repo_root)?;
+    // Convert to JSON values, taking last `limit` events
+    let json_events: Vec<serde_json::Value> = events
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|e| serde_json::to_value(e).unwrap_or_default())
+        .collect();
+    Ok(ProviderAuditResult {
+        success: true,
+        event_count: json_events.len(),
+        events: json_events,
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DenseBuildResult {
+    success: bool,
+    experimental: bool,
+    provider: String,
+    record_count: usize,
+    skipped: usize,
+    blocked: usize,
+    remote_calls: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_path: Option<String>,
+}
+
+fn dense_build(
+    repo_root: &Path,
+    policy: &Policy,
+    provider_name: &str,
+    experimental: bool,
+) -> Result<DenseBuildResult> {
+    if !experimental {
+        return Ok(DenseBuildResult {
+            success: false,
+            experimental: false,
+            provider: provider_name.into(),
+            record_count: 0,
+            skipped: 0,
+            blocked: 0,
+            remote_calls: 0,
+            error: Some("dense indexing requires --experimental flag to opt in".into()),
+            store_path: None,
+            audit_path: None,
+        });
+    }
+
+    let prov: Box<dyn EmbeddingProvider> = match provider::create_provider(provider_name) {
+        Ok(p) => p,
+        Err(e) => {
+            // Write audit event for unknown provider
+            let audit_event = openlocus_provider::model::EmbeddingAuditEvent {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                event: "provider_unavailable".into(),
+                request_id: format!("build-{}", chrono::Utc::now().timestamp_millis()),
+                provider_id: provider_name.into(),
+                model_id: "unknown".into(),
+                locality: openlocus_provider::model::ProviderLocality::Disabled,
+                purpose: "index".into(),
+                path: None,
+                line_range: None,
+                data_level: 0,
+                view_kind: "metadata".into(),
+                bytes_selected: 0,
+                text_sha: String::new(),
+                secret_scan: "skipped".into(),
+                policy_decision: "deny".into(),
+                cache_key: String::new(),
+                outbound_attempted: false,
+                reason: Some(e.to_string()),
+            };
+            let _ = openlocus_provider::audit::append_audit_event(repo_root, &audit_event);
+            return Ok(DenseBuildResult {
+                success: false,
+                experimental: true,
+                provider: provider_name.into(),
+                record_count: 0,
+                skipped: 0,
+                blocked: 0,
+                remote_calls: 0,
+                error: Some(format!(
+                    "unknown provider '{}'; supported providers: mock, disabled",
+                    provider_name
+                )),
+                store_path: None,
+                audit_path: None,
+            });
+        }
+    };
+
+    let metadata = prov.metadata().clone();
+
+    if !metadata.locality.is_available() {
+        // Write audit event for disabled provider
+        let audit_event = openlocus_provider::model::EmbeddingAuditEvent {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            event: "provider_unavailable".into(),
+            request_id: format!("build-{}", chrono::Utc::now().timestamp_millis()),
+            provider_id: provider_name.into(),
+            model_id: "disabled".into(),
+            locality: openlocus_provider::model::ProviderLocality::Disabled,
+            purpose: "index".into(),
+            path: None,
+            line_range: None,
+            data_level: 0,
+            view_kind: "metadata".into(),
+            bytes_selected: 0,
+            text_sha: String::new(),
+            secret_scan: "skipped".into(),
+            policy_decision: "deny".into(),
+            cache_key: String::new(),
+            outbound_attempted: false,
+            reason: Some(format!("provider '{}' is not available", provider_name)),
+        };
+        let _ = openlocus_provider::audit::append_audit_event(repo_root, &audit_event);
+        return Ok(DenseBuildResult {
+            success: false,
+            experimental: true,
+            provider: provider_name.into(),
+            record_count: 0,
+            skipped: 0,
+            blocked: 0,
+            remote_calls: 0,
+            error: Some(format!("provider '{}' is not available", provider_name)),
+            store_path: None,
+            audit_path: None,
+        });
+    }
+
+    let records = scan_repo(repo_root, policy)?;
+    let build_result =
+        JsonlEmbeddingStore::build(repo_root, &records, prov.as_ref(), &metadata, policy)?;
+
+    let store_path = repo_root
+        .join(openlocus_provider::dense_store::STORE_RELATIVE_PATH)
+        .to_str()
+        .unwrap_or_default()
+        .to_string();
+    let audit_path = repo_root
+        .join(openlocus_provider::audit::AUDIT_RELATIVE_PATH)
+        .to_str()
+        .unwrap_or_default()
+        .to_string();
+
+    Ok(DenseBuildResult {
+        success: true,
+        experimental: true,
+        provider: provider_name.into(),
+        record_count: build_result.record_count,
+        skipped: build_result.skipped,
+        blocked: build_result.blocked,
+        remote_calls: 0,
+        error: None,
+        store_path: Some(store_path),
+        audit_path: Some(audit_path),
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DenseSearchResult {
+    success: bool,
+    query_sha: String,
+    query_len: usize,
+    provider: String,
+    evidence: Vec<Evidence>,
+    skipped_count: usize,
+    blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+fn dense_search(
+    repo_root: &Path,
+    policy: &Policy,
+    query: &str,
+    provider_name: &str,
+    limit: usize,
+) -> Result<DenseSearchResult> {
+    let query_sha = blake3::hash(query.as_bytes()).to_hex().to_string();
+    let query_len = query.len();
+
+    let prov: Box<dyn EmbeddingProvider> = match provider::create_provider(provider_name) {
+        Ok(p) => p,
+        Err(e) => {
+            // Write audit event for unknown provider
+            let audit_event = openlocus_provider::model::EmbeddingAuditEvent {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                event: "provider_unavailable".into(),
+                request_id: format!("search-{}", chrono::Utc::now().timestamp_millis()),
+                provider_id: provider_name.into(),
+                model_id: "unknown".into(),
+                locality: openlocus_provider::model::ProviderLocality::Disabled,
+                purpose: "query".into(),
+                path: None,
+                line_range: None,
+                data_level: 0,
+                view_kind: "query".into(),
+                bytes_selected: 0,
+                text_sha: query_sha.clone(),
+                secret_scan: "skipped".into(),
+                policy_decision: "deny".into(),
+                cache_key: String::new(),
+                outbound_attempted: false,
+                reason: Some(e.to_string()),
+            };
+            let _ = openlocus_provider::audit::append_audit_event(repo_root, &audit_event);
+            return Ok(DenseSearchResult {
+                success: false,
+                query_sha,
+                query_len,
+                provider: provider_name.into(),
+                evidence: vec![],
+                skipped_count: 0,
+                blocked: false,
+                reason: Some(format!(
+                    "unknown provider '{}'; supported providers: mock, disabled",
+                    provider_name
+                )),
+            });
+        }
+    };
+
+    let metadata = prov.metadata().clone();
+
+    if !metadata.locality.is_available() {
+        // Write audit event for disabled provider
+        let audit_event = openlocus_provider::model::EmbeddingAuditEvent {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            event: "provider_unavailable".into(),
+            request_id: format!("search-{}", chrono::Utc::now().timestamp_millis()),
+            provider_id: provider_name.into(),
+            model_id: "disabled".into(),
+            locality: openlocus_provider::model::ProviderLocality::Disabled,
+            purpose: "query".into(),
+            path: None,
+            line_range: None,
+            data_level: 0,
+            view_kind: "query".into(),
+            bytes_selected: 0,
+            text_sha: query_sha.clone(),
+            secret_scan: "skipped".into(),
+            policy_decision: "deny".into(),
+            cache_key: String::new(),
+            outbound_attempted: false,
+            reason: Some(format!("provider '{}' is not available", provider_name)),
+        };
+        let _ = openlocus_provider::audit::append_audit_event(repo_root, &audit_event);
+        return Ok(DenseSearchResult {
+            success: false,
+            query_sha,
+            query_len,
+            provider: provider_name.into(),
+            evidence: vec![],
+            skipped_count: 0,
+            blocked: false,
+            reason: Some(format!("provider '{}' is not available", provider_name)),
+        });
+    }
+
+    let search_result =
+        JsonlEmbeddingStore::search(repo_root, query, prov.as_ref(), &metadata, policy, limit)?;
+
+    if search_result.blocked {
+        return Ok(DenseSearchResult {
+            success: false,
+            query_sha,
+            query_len,
+            provider: provider_name.into(),
+            evidence: vec![],
+            skipped_count: 0,
+            blocked: true,
+            reason: search_result.reason,
+        });
+    }
+
+    if search_result.reason.is_some() && search_result.hits.is_empty() {
+        return Ok(DenseSearchResult {
+            success: false,
+            query_sha,
+            query_len,
+            provider: provider_name.into(),
+            evidence: vec![],
+            skipped_count: 0,
+            blocked: false,
+            reason: search_result.reason,
+        });
+    }
+
+    // Materialize StoreHits to Evidence
+    let mut evidence = Vec::new();
+    let mut skipped_count = 0usize;
+    for hit in &search_result.hits {
+        match openlocus_store::materialize_evidence(repo_root, hit, Channel::Dense) {
+            Ok(ev) => evidence.push(ev),
+            Err(_) => skipped_count += 1,
+        }
+    }
+
+    Ok(DenseSearchResult {
+        success: true,
+        query_sha,
+        query_len,
+        provider: provider_name.into(),
+        evidence,
+        skipped_count,
+        blocked: false,
+        reason: None,
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DensePurgeResult {
+    success: bool,
+    purged: bool,
+    record_count: usize,
+}
+
+fn dense_purge(repo_root: &Path) -> Result<DensePurgeResult> {
+    let count = JsonlEmbeddingStore::purge(repo_root)?;
+    Ok(DensePurgeResult {
+        success: true,
+        purged: true,
+        record_count: count,
+    })
 }
