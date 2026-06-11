@@ -9,6 +9,8 @@ use openlocus_derived::generator;
 use openlocus_derived::model::{DerivedIndexView, DerivedViewKind};
 use openlocus_derived::store::JsonlDerivedViewStore;
 use openlocus_derived::validation;
+use openlocus_graph::graph::{self, EdgeKind, GraphEdge};
+use openlocus_graph::materialize::materialize_graph_edges;
 use openlocus_repo::read::read_file;
 use openlocus_repo::scan::scan_repo;
 use openlocus_repo::validate_path;
@@ -92,6 +94,31 @@ pub enum Commands {
     Derived {
         #[command(subcommand)]
         derived_cmd: DerivedCommands,
+    },
+    /// Graph operations (build, inspect)
+    Graph {
+        #[command(subcommand)]
+        graph_cmd: GraphCommands,
+    },
+    /// Impact analysis: files that depend on or test a given path
+    Impact {
+        /// Path spec: e.g. src/lib.rs or src/lib.rs:10
+        path_spec: String,
+        /// Traversal depth (only 1 supported in Level0)
+        #[arg(long, default_value_t = 1)]
+        depth: u8,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select test files relevant to a path
+    Tests {
+        /// Filter by source path
+        #[arg(long)]
+        path: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Print version
     Version,
@@ -225,6 +252,28 @@ pub enum DerivedCommands {
     },
     /// Purge all stored derived views
     Purge {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GraphCommands {
+    /// Build graph from repo files
+    Build {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect graph edges
+    Inspect {
+        /// Filter by edge kind: imports, tests, configures
+        #[arg(long)]
+        kind: Option<String>,
+        /// Maximum number of edges to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -501,6 +550,142 @@ pub fn run() -> Result<()> {
         Commands::Version => {
             println!("openlocus {}", env!("CARGO_PKG_VERSION"));
             Ok(())
+        }
+        Commands::Graph { graph_cmd } => match graph_cmd {
+            GraphCommands::Build { json } => {
+                let records = scan_repo(&repo_root, &policy)?;
+                let (nodes, edges, result) = graph::build_graph(&repo_root, &records)?;
+                trace_event(
+                    &repo_root,
+                    "graph_build",
+                    serde_json::json!({}),
+                    serde_json::json!({"node_count": result.node_count, "edge_count": result.edge_count}),
+                );
+                let output = serde_json::json!({
+                    "success": true,
+                    "node_count": result.node_count,
+                    "edge_count": result.edge_count,
+                    "edges_by_kind": result.edges_by_kind,
+                    "skipped_stale": result.skipped_stale,
+                    "skipped_path_unsafe": result.skipped_path_unsafe,
+                });
+                let _ = (nodes, edges); // used by inspect/impact via re-scan
+                print_output(&output, json)
+            }
+            GraphCommands::Inspect { kind, limit, json } => {
+                let records = scan_repo(&repo_root, &policy)?;
+                let (_nodes, edges, _result) = graph::build_graph(&repo_root, &records)?;
+
+                let filtered: Vec<&GraphEdge> = if let Some(k) = &kind {
+                    let target = match k.as_str() {
+                        "imports" => Some(EdgeKind::Imports),
+                        "tests" => Some(EdgeKind::Tests),
+                        "configures" => Some(EdgeKind::Configures),
+                        _ => None,
+                    };
+                    edges
+                        .iter()
+                        .filter(|e| Some(&e.kind) == target.as_ref())
+                        .take(limit)
+                        .collect()
+                } else {
+                    edges.iter().take(limit).collect()
+                };
+
+                trace_event(
+                    &repo_root,
+                    "graph_inspect",
+                    serde_json::json!({"kind": kind, "limit": limit}),
+                    serde_json::json!({"edge_count": filtered.len()}),
+                );
+
+                // Wrap with artifact marker so consumers know these are edges, not Evidence
+                let output = serde_json::json!({
+                    "artifact": "graph_edges_not_evidence",
+                    "note": "These are GraphEdge records, not citation-valid Evidence. Use 'impact' or 'tests' commands for materialized Evidence.",
+                    "count": filtered.len(),
+                    "edges": filtered,
+                });
+                print_output(&output, json)
+            }
+        },
+        Commands::Impact {
+            path_spec,
+            depth,
+            json,
+        } => {
+            if depth > 1 {
+                let result = serde_json::json!({
+                    "success": false,
+                    "error": format!("R5 Level0 only supports depth=1; depth={} is not implemented", depth),
+                    "depth": depth,
+                });
+                trace_event(
+                    &repo_root,
+                    "impact",
+                    serde_json::json!({"path_spec": path_spec, "depth": depth}),
+                    serde_json::json!({"success": false}),
+                );
+                return print_output(&result, json);
+            }
+
+            // Parse path spec (just the path part, ignoring line numbers for impact)
+            let target_path = path_spec
+                .split(':')
+                .next()
+                .unwrap_or(&path_spec)
+                .to_string();
+
+            let records = scan_repo(&repo_root, &policy)?;
+            let (_nodes, edges, _result) = graph::build_graph(&repo_root, &records)?;
+
+            let impact = graph::impact_edges(&edges, &target_path, depth)?;
+
+            // Materialize evidence from impact edges
+            let (evidence, skipped) = materialize_graph_edges(&repo_root, &impact);
+
+            let result = serde_json::json!({
+                "success": true,
+                "path": target_path,
+                "depth": depth,
+                "impact_count": impact.len(),
+                "evidence_count": evidence.len(),
+                "skipped": skipped,
+                "evidence": evidence,
+            });
+
+            trace_event(
+                &repo_root,
+                "impact",
+                serde_json::json!({"path_spec": path_spec, "depth": depth}),
+                serde_json::json!({"impact_count": impact.len(), "evidence_count": evidence.len()}),
+            );
+            print_output(&result, json)
+        }
+        Commands::Tests { path, json } => {
+            let records = scan_repo(&repo_root, &policy)?;
+            let (_nodes, edges, _result) = graph::build_graph(&repo_root, &records)?;
+
+            let test_edges = graph::test_edges(&edges, path.as_deref());
+
+            // Materialize evidence from test source files
+            let test_edges_owned: Vec<_> = test_edges.into_iter().cloned().collect();
+            let (test_evidence, skipped) = materialize_graph_edges(&repo_root, &test_edges_owned);
+
+            let result = serde_json::json!({
+                "success": true,
+                "test_count": test_evidence.len(),
+                "skipped": skipped,
+                "evidence": test_evidence,
+            });
+
+            trace_event(
+                &repo_root,
+                "tests_select",
+                serde_json::json!({"path": path}),
+                serde_json::json!({"test_count": test_evidence.len(), "skipped": skipped}),
+            );
+            print_output(&result, json)
         }
     }
 }

@@ -260,3 +260,63 @@ A derived index view system with strict safety gates (no-LLM-required generator,
 - No real LLM adapter exists. The MockLlm generator kind is defined but not implemented.
 - Derived views are not integrated with the RRF retrieval pipeline; this is a future optimization.
 - The secrets/ directory is not in the default exclude list; only .env* and **/*.pem are excluded by default.
+
+## 2026-06-11 — R5 Semantic Graph Level0 Deterministic Scaffold
+
+### Objective
+
+Implement a local-only, deterministic, depth=1 semantic graph scaffold. No LSP/SCIP/LLM. Graph candidates cannot directly substitute for Evidence; must be materialized through StoreHit → `openlocus_store::materialize_evidence()`.
+
+### Implementation
+
+1. **openlocus-graph crate**: Types (GraphNode, GraphEdge with source_content_sha/source_language, EdgeKind, GraphBuildResult, GraphCapabilities), builder, and materializer.
+2. **Edge kinds**:
+   - imports: parse Rust `mod/use`, TS/JS `import ... from`, Python `import/from`, Go `import` lines. Resolution uses path_set and basename_index.
+   - tests: path/name heuristic (tests/ dir, *_test.*, *.test.*, test_*) linking to source files with matching basename.
+   - configures: config files (Cargo.toml, package.json, etc.) to nearby source files (bounded max 50).
+3. **Safe record construction**: `build_graph` validates paths and current sha, creates safe_records, and builds import/test/config edges only from safe/current records. Stale and path-unsafe records are counted and skipped.
+4. **Materialization via StoreHit**: `materialize_graph_evidence()` converts GraphEdge to StoreHit and delegates to `openlocus_store::materialize_evidence(repo_root, &hit, Channel::Graph)`. Invalid ranges are rejected (not clamped). Graph-specific why/score_parts are added post-materialization without changing span/hash.
+5. **Depth gate**: depth>1 returns error, not silently expanded.
+6. **CLI**: `graph build`, `graph inspect` (with artifact="graph_edges_not_evidence" marker), `impact <path> --depth N` (with skipped count), `tests select --path P` (with skipped count).
+
+### Oracle review fixes
+
+- GraphEdge now carries source_content_sha and source_language at build time.
+- materialize_graph_evidence converts to StoreHit and calls openlocus_store::materialize_evidence (not hand-building Evidence). Invalid ranges rejected (not clamped).
+- build_graph builds safe_records/path_set/sha map from validated current records only; test/config edges built from safe_records only.
+- graph inspect wraps output with artifact="graph_edges_not_evidence" marker.
+- tests command includes skipped count.
+- eval/graph_smoke.py uses synthetic temp fixture repo, includes import/test/config examples, true citation validation via `openlocus citations validate`, policy-excluded file checks, depth-2 blocking.
+
+### R5 Level0 results (after oracle review)
+
+| Check | Result |
+|---|---|
+| Graph build succeeds | ✅ |
+| Edges > 0 (imports + configures + tests) | ✅ |
+| Inspect has artifact marker | ✅ |
+| Impact returns citation-valid evidence | ✅ verified via citations validate |
+| Depth=2 blocked | ✅ clear error JSON |
+| Tests select works | ✅ with skipped count |
+| Stale check active (skipped_stale field) | ✅ |
+| Policy excluded (.env, .pem) absent from edges | ✅ |
+| StoreHit materialization gate | ✅ edges → StoreHit → materialize_evidence |
+
+### Key findings
+
+1. Simple line-based import parsing is surprisingly effective for Rust and Python repos. The path_set resolution approach (look for candidate files in same directory or by basename) avoids needing a full module resolver.
+2. Config edges dominate because each config file links to all nearby source files. This is noisy but safe for Level0.
+3. Test heuristics work for common patterns (*_test.rs, *.test.ts, tests/ dir) but don't handle inline tests or less common naming conventions.
+4. Materialization via StoreHit gate is essential: graph edges carry build-time sha, and `materialize_evidence` rejects stale/invalid hits. This means graph-derived evidence is always citation-valid.
+5. Graph is rebuilt on each command (not persisted). Stale records are caught at build time.
+
+### Caveats
+
+- This is a Level0 deterministic scaffold only. Not a precise call graph, type graph, or dependency graph.
+- Import parsing is line-based heuristic, not a full parser. It will miss multi-line imports and macro-generated code.
+- Go import resolution is not implemented (requires module path mapping).
+- Test heuristic only links by filename/path convention, not by analyzing test content.
+- Config edges are noisy (many false positives). A future version should be more targeted.
+- Graph is rebuilt on each command (not persisted). For large repos, this needs caching.
+- Stale detection works at build time only (graph rebuilt per command). A persistent graph would need materialization-time stale checks, which the StoreHit gate already provides.
+- Graph edges are not integrated with the RRF retrieval pipeline; this is a future optimization.

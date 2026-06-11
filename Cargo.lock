@@ -837,6 +837,7 @@ dependencies = [
  "clap",
  "openlocus-core",
  "openlocus-derived",
+ "openlocus-graph",
  "openlocus-repo",
  "openlocus-retrieval",
  "openlocus-store",
@@ -871,6 +872,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "openlocus-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "openlocus-core",
+ "openlocus-repo",
+ "openlocus-store",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
