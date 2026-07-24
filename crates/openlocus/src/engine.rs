@@ -1,4 +1,4 @@
-use crate::index::{IndexStore, purge, status_without_open};
+use crate::index::{IndexStore, prepare_roots, purge, status_without_open};
 use crate::model::{
     BuildSummary, Citation, CitationValidation, Evidence, IndexStatus, QueryDiagnostics,
     QueryRequest, QueryResult, QueryStatus, UpdateSummary,
@@ -6,8 +6,7 @@ use crate::model::{
 use crate::policy::Policy;
 use crate::rank::fuse;
 use crate::repo::{
-    MaterializedCandidate, canonical_source_root, literal_search, materialize_candidate, read,
-    validate_citation,
+    MaterializedCandidate, literal_search, materialize_candidate, read, validate_citation,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -26,8 +25,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn open(source_root: impl AsRef<Path>, state_root: impl AsRef<Path>) -> Result<Self> {
-        let source_root = canonical_source_root(source_root.as_ref())?;
-        let state_root = state_root.as_ref().to_path_buf();
+        let (source_root, state_root) = prepare_roots(source_root.as_ref(), state_root.as_ref())?;
         let policy = Policy::load(&source_root)?;
         let (index, index_error) = match IndexStore::open(&source_root, &state_root, &policy) {
             Ok(index) => (index, None),
@@ -43,6 +41,7 @@ impl Engine {
     }
 
     pub fn build_index(&mut self) -> Result<BuildSummary> {
+        drop(self.index.take());
         let (index, summary) =
             IndexStore::build(&self.source_root, &self.state_root, &self.policy)?;
         self.index = Some(index);
@@ -144,7 +143,7 @@ impl Engine {
 }
 
 pub fn default_state_root(source_root: impl AsRef<Path>) -> Result<PathBuf> {
-    let source_root = canonical_source_root(source_root.as_ref())?;
+    let source_root = crate::repo::canonical_source_root(source_root.as_ref())?;
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
@@ -186,5 +185,16 @@ mod tests {
             updated.diagnostics.channels_used,
             vec![Channel::Literal, Channel::Bm25]
         );
+    }
+
+    #[test]
+    fn an_open_index_can_be_rebuilt() {
+        let source = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("lib.rs"), "fn marker() {}\n").unwrap();
+        let mut engine = Engine::open(source.path(), state.path()).unwrap();
+        engine.build_index().unwrap();
+        engine.build_index().unwrap();
+        assert!(engine.index_status().ready);
     }
 }

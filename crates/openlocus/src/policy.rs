@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-const POLICY_PATH: &str = ".openlocus/policy.toml";
+const POLICY_PATH: &str = "openlocus.toml";
+const MAX_CONFIGURED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,9 +35,20 @@ impl Policy {
         if !path.exists() {
             return Ok(Self::default());
         }
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            bail!(
+                "policy file must not be a symbolic link: {}",
+                path.display()
+            );
+        }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
+        let policy: Self =
+            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        if !(1..=MAX_CONFIGURED_FILE_BYTES).contains(&policy.max_file_bytes) {
+            bail!("max_file_bytes must be between 1 and {MAX_CONFIGURED_FILE_BYTES}");
+        }
+        Ok(policy)
     }
 
     pub(crate) fn hash(&self) -> Result<String> {
@@ -112,8 +124,14 @@ mod tests {
     #[test]
     fn malformed_policy_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".openlocus")).unwrap();
         std::fs::write(dir.path().join(POLICY_PATH), "include = [this is not toml").unwrap();
+        assert!(Policy::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn unsafe_file_size_limit_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(POLICY_PATH), "max_file_bytes = 0\n").unwrap();
         assert!(Policy::load(dir.path()).is_err());
     }
 

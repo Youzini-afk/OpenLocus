@@ -4,6 +4,7 @@ use crate::repo::{canonical_source_root, normalize_relative, scan, validate_sour
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -418,8 +419,14 @@ fn add_file_documents(
     Ok(chunks)
 }
 
-fn prepare_roots(source_root: &Path, state_root: &Path) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn prepare_roots(source_root: &Path, state_root: &Path) -> Result<(PathBuf, PathBuf)> {
     let source_root = canonical_source_root(source_root)?;
+    let prospective_state_root = resolve_without_creating(state_root)?;
+    if source_root.starts_with(&prospective_state_root)
+        || prospective_state_root.starts_with(&source_root)
+    {
+        bail!("state root and source root must not overlap");
+    }
     fs::create_dir_all(state_root)
         .with_context(|| format!("failed to create state root: {}", state_root.display()))?;
     reject_link(state_root)?;
@@ -430,6 +437,40 @@ fn prepare_roots(source_root: &Path, state_root: &Path) -> Result<(PathBuf, Path
         bail!("state root and source root must not overlap");
     }
     Ok((source_root, state_root))
+}
+
+fn resolve_without_creating(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::<OsString>::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .context("state root has no existing ancestor")?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("state root has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("failed to inspect state root"),
+        }
+    }
+    let mut resolved = ancestor
+        .canonicalize()
+        .context("failed to resolve state root ancestor")?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 fn validate_manifest(manifest: &Manifest, source_root: &Path, policy: &Policy) -> Result<()> {
@@ -575,6 +616,7 @@ mod tests {
         let state = source.path().join("state");
         let error = prepare_roots(source.path(), &state).unwrap_err();
         assert!(error.to_string().contains("must not overlap"));
+        assert!(!state.exists());
     }
 
     #[test]
