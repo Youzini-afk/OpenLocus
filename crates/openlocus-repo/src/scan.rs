@@ -41,7 +41,11 @@ pub fn scan_repo(root: &Path, policy: &Policy) -> Result<Vec<FileRecord>> {
 
                 // Get relative path
                 let relative = path.strip_prefix(root).unwrap_or(path);
-                let relative_str = relative.to_string_lossy().to_string();
+                let relative_str = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
 
                 // Skip files matching default ignore dirs
                 if is_default_ignored(&relative_str) {

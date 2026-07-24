@@ -185,6 +185,34 @@ pub fn guess_language(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn symlink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(src, dst)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(src, dst)
+    }
+
+    #[cfg(windows)]
+    fn symlink_unavailable_for_test(err: &std::io::Error) -> bool {
+        err.raw_os_error() == Some(1314)
+    }
+
+    #[cfg(not(windows))]
+    fn symlink_unavailable_for_test(_err: &std::io::Error) -> bool {
+        false
+    }
+
+    fn create_symlink_file_for_test(src: &Path, dst: &Path) -> bool {
+        match symlink_file(src, dst) {
+            Ok(()) => true,
+            Err(err) if symlink_unavailable_for_test(&err) => false,
+            Err(err) => panic!("failed to create symlink test fixture: {err}"),
+        }
+    }
     use std::io::Write;
 
     #[test]
@@ -235,15 +263,9 @@ mod tests {
         fs::create_dir_all(&outside_dir).unwrap();
         fs::write(outside_dir.join("secret.txt"), "secret").unwrap();
 
-        // Create a symlink inside the repo pointing outside the repo
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink(
-                dir.path().join("../outside_escape_test/secret.txt"),
-                root.join("escape.txt"),
-            )
-            .unwrap();
+        let outside_file = outside_dir.join("secret.txt");
+        if !create_symlink_file_for_test(&outside_file, &root.join("escape.txt")) {
+            return;
         }
 
         let result = validate_path(root, "escape.txt");
@@ -258,11 +280,8 @@ mod tests {
         // Create a real file inside the repo
         fs::write(root.join("real.txt"), "content").unwrap();
 
-        // Create a symlink inside the repo pointing to another file in the repo
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+        if !create_symlink_file_for_test(&root.join("real.txt"), &root.join("link.txt")) {
+            return;
         }
 
         let result = validate_path(root, "link.txt");
